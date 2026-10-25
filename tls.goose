@@ -8,6 +8,8 @@ namespace tls;
 
 import std;
 import bignum from "../bigmongoose.git";
+import asn1 from "../asn1goose.git";
+import x509 from "../x509goose.git";
 
 // Record content types (RFC 8446 §5.1).
 let CT_CHANGE_CIPHER_SPEC: u8 = 20;

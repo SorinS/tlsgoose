@@ -6,6 +6,8 @@
 import std;
 import tls from "..";
 import bignum from "../../bigmongoose.git";
+import asn1 from "../../asn1goose.git";
+import x509 from "../../x509goose.git";
 import tls.schedule;
 import tls.record;
 import bignum.x25519;

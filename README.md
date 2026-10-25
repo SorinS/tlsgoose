@@ -1,9 +1,12 @@
 # tls
 
-TLS 1.3 (RFC 8446) for the Goose language, on the primitives of
-[bignum](../bigmongoose.git). So far it has the key schedule and the record
-layer. The handshake state machine comes next. Nothing here does I/O: all
-functions work on byte strings, and the caller moves the bytes.
+TLS 1.3 (RFC 8446) for the Goose language: client and server
+connections, the key schedule and the record layer. It builds on
+[bignum](../bigmongoose.git) for the cryptography,
+[x509](../x509goose.git) for certificates and [asn1](../asn1goose.git)
+for keys. Nothing here does I/O: a connection is fed the bytes that
+arrive, and hands back the bytes to send and the application data
+received. The caller owns the socket, or the pipe, or the test harness.
 
 - **`tls`**: cipher suites (`TLS_AES_128_GCM_SHA256`,
   `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`), content,
@@ -13,6 +16,8 @@ functions work on byte strings, and the caller moves the bytes.
   traffic keys, Finished, KeyUpdate, exporters, resumption PSKs and binder
   keys, and a running transcript hash, including the HelloRetryRequest
   restart.
+- **`tls.handshake`**: `Conn`, the client and server state machines,
+  their configurations, and key loading.
 - **`tls.record`**: plaintext and protected records, the per-record nonce,
   content-type hiding and padding, size limits with the alert each failure
   calls for, fragmenting long data, and framing records and handshake
@@ -36,6 +41,53 @@ let rec = tls::seal_record(out, tls::CT_HANDSHAKE, flight);
 var inn = tls::record_keys(s, sch.s_hs);        // the client reads with it
 let ctype, plaintext, alert = tls::open_record(inn, rec);   // alert != 0: send it, close
 ```
+
+## Connections
+
+```goose
+import tls.handshake;
+
+var cfg = tls::client_config("example.com", roots_der);   // roots: DER certificates concatenated
+tls::add_alpn(cfg.alpn, "http/1.1");
+var c = tls::client(cfg);
+var out: u8[>..] = [];
+var app: u8[>..] = [];
+tls::client_start(c, cfg, out);                // the ClientHello
+loop {
+    // send `out`, read some bytes into `input`
+    out.clear();
+    if tls::client_feed(c, cfg, input, out, app) != 0 { break; }   // c.alert says why
+    if tls::connected(c) { break; }
+}
+tls::send(c, request, out);                    // application data; replies arrive in `app`
+tls::close(c, out);
+```
+
+A server is the same, built from
+`tls::server_config(chain_der, key_der) -> ServerConfig, bool`, with
+`tls::server(cfg)` and `tls::server_feed`. The key may be PKCS #8 (RSA,
+EC, Ed25519), SEC 1 or PKCS #1 DER.
+
+| | Client | Server |
+|---|---|---|
+| Suites | all three, in `cfg.suites` order | its own order of preference |
+| Key exchange | X25519, P-256, P-384; a share for the first of `cfg.groups`, the others through HelloRetryRequest | its first group the client has a share for, else a HelloRetryRequest for its first group the client supports |
+| Certificates | checked by `x509::verify_chain`: chain to `cfg.roots`, name `cfg.server_name`, time `cfg.now` (0 for now); `cfg.verify = false` skips it | sends `cfg.chain`, signs CertificateVerify with RSA-PSS, ECDSA or Ed25519 as its key and the client allow |
+| CertificateVerify | RSA-PSS, RSA PKCS #1 v1.5, ECDSA P-256/P-384, Ed25519 | |
+| ALPN | `cfg.alpn` offered | its first protocol the client offered, or `no_application_protocol` |
+| After the handshake | NewSessionTicket counted and dropped; KeyUpdate both ways (`key_update(c, request, out)`) | KeyUpdate |
+
+Both sides use middlebox compatibility mode (a session ID and
+change_cipher_spec), reassemble handshake messages across records, insist
+that a key change falls on a record boundary, and on any error send the
+fatal alert RFC 8446 calls for and stop. `c.alert` holds the alert sent or
+received, and `c.error` the x509 error behind a certificate alert. Every
+random value comes from an HMAC-DRBG seeded from the OS. A config's
+`seed` fixes it, for tests.
+
+Not supported: PSK, resumption and 0-RTT (tickets are ignored), client
+certificates (a request is answered with an empty Certificate), and TLS
+1.2 or older.
 
 ## The key schedule
 
@@ -84,6 +136,24 @@ python3 scripts/run_tests.py --native   # also built with the C compiler
 - `record_api`: refused headers and records with their alerts, padding,
   typeless records, fragmenting, nonces, KeyUpdate, the HelloRetryRequest
   transcript, exporters.
+
+- `handshake`: this package's client against its server in memory, for
+  every server key type with each suite and group. Each run includes
+  HelloRetryRequest, ALPN, data both ways, KeyUpdate and close_notify.
+  The failures covered: an unknown CA, a wrong name, an expired
+  certificate, no common suite or group, an ALPN mismatch, and a changed
+  record. Input is also fed a byte at a time.
+
+`scripts/live_interop.py` runs live connections against OpenSSL (31
+cases). It builds `tools/peer.goose`, a peer driven over stdin and stdout,
+and relays its bytes to Python's ssl module through memory BIOs. It
+covers:
+- this client against an OpenSSL server, and this server against an
+  OpenSSL client, for each certificate type, suite and group;
+- a HelloRetryRequest in each direction (the OpenSSL client offers its
+  post-quantum hybrid share first);
+- ALPN both ways, a KeyUpdate that OpenSSL answers, and close_notify;
+- an untrusted root and a wrong name.
 
 The compiler is found as in bignum: `--goose`, `$GOOSE`, `goose` on PATH,
 then `../goose.git/build/goose`.
