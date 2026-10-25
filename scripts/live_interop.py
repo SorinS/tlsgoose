@@ -26,7 +26,7 @@ ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 VEC = os.path.join(ROOT, "test", "vectors")
 SUITES = {"1301": "TLS_AES_128_GCM_SHA256", "1302": "TLS_AES_256_GCM_SHA384",
           "1303": "TLS_CHACHA20_POLY1305_SHA256"}
-GROUPS = {"001d": "X25519", "0017": "P-256", "0018": "P-384"}
+GROUPS = {"001d": "X25519", "0017": "P-256", "0018": "P-384", "0019": "P-521"}
 
 
 class Peer:
@@ -159,8 +159,8 @@ def main():
     subprocess.run([goose, "build", "-o", exe, os.path.join(ROOT, "tools", "peer.goose")], check=True,
                    capture_output=True)
     cases = []
-    for cert in ("ed25519", "p256", "p384", "rsa"):
-        for s, g in (("1301", "001d"), ("1302", "0017"), ("1303", "0018")):
+    for cert in ("ed25519", "p256", "p384", "p521", "rsa"):
+        for s, g in (("1301", "001d"), ("1302", "0017"), ("1303", "0018"), ("1301", "0019")):
             cases.append(dict(name=f"goose client, {cert} server, {SUITES[s]}, {GROUPS[g]}", role="client",
                               cert=cert, goose_suites=[s], goose_groups=[g], want=True, suite=SUITES[s]))
             cases.append(dict(name=f"goose {cert} server, {SUITES[s]}, {GROUPS[g]}", role="server",

@@ -80,7 +80,7 @@ def main():
         expected = os.path.join(test_dir, "expected", name + ".txt")
         for flags in (["-O0"], ["-O2"], ["--debug"]):
             rc, out, err = run([goose, *flags, t], test_dir)
-            if args.update and flags == ["-O2"] and rc == 0:
+            if args.update and flags == ["-O0"] and rc == 0:
                 os.makedirs(os.path.dirname(expected), exist_ok=True)
                 with open(expected, "w") as f:
                     f.write(out)

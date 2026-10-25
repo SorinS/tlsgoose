@@ -38,6 +38,7 @@ def main():
         for kind, args in [("ed25519", ["-algorithm", "ED25519"]),
                            ("p256", ["-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256"]),
                            ("p384", ["-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-384"]),
+                           ("p521", ["-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-521"]),
                            ("rsa", ["-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048"])]:
             ossl("genpkey", *args, "-out", p(f"{kind}.key"))
             ossl("req", "-new", "-key", p(f"{kind}.key"), "-subj", "/CN=example.com", "-out", p(f"{kind}.csr"))
