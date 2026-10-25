@@ -34,6 +34,7 @@ import bignum.entropy;
 import asn1;
 import x509;
 import x509.verify;
+import x509.keys;
 
 // Named groups and the signature schemes this package signs and verifies.
 let GROUP_SECP256R1: u16 = 0x0017;
@@ -110,99 +111,23 @@ fn add_alpn(list: u8[..255]&, proto: const u8[:]) {
 // groups, suites and ALPN protocols in order of preference, a DRBG seed,
 // and its certificate chain as concatenated DER, the leaf first.
 struct ServerConfig {
-    key_type: i64, ec_sk: u8[..66], ed_seed: u8[32], rsa: bignum::RsaPrivateKey,
+    key: x509::PrivateKey,
     groups: u16[..8], suites: u16[..8], alpn: u8[..255], seed: u64,
     chain: u8[>..],
-}
-
-fn empty_rsa() -> bignum::RsaPrivateKey {
-    bignum::RsaPrivateKey { n: [], e: [], d: [], p: [], q: [], dp: [], dq: [], qinv: [] }
 }
 
 // A server configuration from a chain (concatenated DER) and a private key
 // in DER: PKCS #8 (RSA, EC or Ed25519), SEC 1 (EC) or PKCS #1 (RSA).
 fn server_config(chain: const u8[:], key_der: const u8[:]) -> ServerConfig, bool {
+    let k, ok = x509::parse_private_key(key_der);
     var s = ServerConfig {
-        key_type: x509::KEY_UNKNOWN, ec_sk: [], ed_seed: [0; 32], rsa: empty_rsa(),
+        key: k,
         groups: [GROUP_X25519, GROUP_SECP256R1, GROUP_SECP384R1, GROUP_SECP521R1],
         suites: [TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256],
         alpn: [], seed: 0, chain: [],
     };
     s.chain.append(chain);
-    let ok = load_key(s, key_der);
     return s, ok;
-}
-
-fn load_rsa(s: ServerConfig&, d: const u8[:], t: asn1::Tlv) -> bool {
-    let f, ok = asn1::children_of(d, t, asn1::SEQUENCE);
-    if !ok || f.len < 9 { return false; }
-    let n, ok1 = asn1::read_uint(d, f[1]);
-    let e, ok2 = asn1::read_uint(d, f[2]);
-    let dd, ok3 = asn1::read_uint(d, f[3]);
-    let p, ok4 = asn1::read_uint(d, f[4]);
-    let q, ok5 = asn1::read_uint(d, f[5]);
-    if !ok1 || !ok2 || !ok3 || !ok4 || !ok5 { return false; }
-    let k, okk = bignum::rsa_key_from(bignum::from_bytes_be(n), bignum::from_bytes_be(e), bignum::from_bytes_be(dd),
-                                      bignum::from_bytes_be(p), bignum::from_bytes_be(q));
-    if !okk { return false; }
-    s.rsa = k;
-    s.key_type = x509::KEY_RSA;
-    return true;
-}
-
-// ECPrivateKey ::= SEQUENCE { 1, privateKey OCTET STRING, [0] curve OPTIONAL, [1] public OPTIONAL }
-fn load_ec(s: ServerConfig&, d: const u8[:], t: asn1::Tlv, curve: i64) -> bool {
-    let f, ok = asn1::children_of(d, t, asn1::SEQUENCE);
-    if !ok || f.len < 2 { return false; }
-    let sk, oks = asn1::read_octets(d, f[1]);
-    if !oks { return false; }
-    var kind = curve;
-    for x in f {
-        if x.tag == asn1::ctx(0, true) {
-            let o, oko = asn1::explicit(d, x);
-            if asn1::oid_is(d, o, "1.2.840.10045.3.1.7") { kind = x509::KEY_EC_P256; }
-            else if asn1::oid_is(d, o, "1.3.132.0.34") { kind = x509::KEY_EC_P384; }
-            else if asn1::oid_is(d, o, "1.3.132.0.35") { kind = x509::KEY_EC_P521; }
-            else { return false; }
-        }
-    }
-    let want = if kind == x509::KEY_EC_P256 { 32 } else if kind == x509::KEY_EC_P384 { 48 }
-               else if kind == x509::KEY_EC_P521 { 66 } else { 0 };
-    if want == 0 || sk.len != want { return false; }
-    s.ec_sk.clear();
-    s.ec_sk.append(sk);
-    s.key_type = kind;
-    return true;
-}
-
-fn load_key(s: ServerConfig&, d: const u8[:]) -> bool {
-    let top, ok = asn1::parse(d);
-    let f, okf = asn1::children_of(d, top, asn1::SEQUENCE);
-    if !ok || !okf || f.len < 2 { return false; }
-    // PKCS #8: version, AlgorithmIdentifier, OCTET STRING.
-    if f.len >= 3 && f[1].tag == asn1::SEQUENCE && f[2].tag == asn1::OCTET_STRING {
-        let alg, oka = asn1::children(d, f[1]);
-        if !oka || alg.len < 1 { return false; }
-        let inner, oki = asn1::read(d, f[2].off, f[2].end);
-        if asn1::oid_is(d, alg[0], "1.2.840.113549.1.1.1") { return oki && load_rsa(s, d, inner); }
-        if asn1::oid_is(d, alg[0], "1.3.101.112") {
-            let seed, okseed = asn1::read_octets(d, inner);
-            if !oki || !okseed || seed.len != 32 { return false; }
-            for i in 32 { s.ed_seed[i] = seed[i]; }
-            s.key_type = x509::KEY_ED25519;
-            return true;
-        }
-        if asn1::oid_is(d, alg[0], "1.2.840.10045.2.1") && alg.len == 2 {
-            let curve = if asn1::oid_is(d, alg[1], "1.2.840.10045.3.1.7") { x509::KEY_EC_P256 }
-                        else if asn1::oid_is(d, alg[1], "1.3.132.0.34") { x509::KEY_EC_P384 }
-                        else if asn1::oid_is(d, alg[1], "1.3.132.0.35") { x509::KEY_EC_P521 } else { 0 };
-            return oki && load_ec(s, d, inner, curve);
-        }
-        return false;
-    }
-    if f.len == 9 { return load_rsa(s, d, top); }                  // PKCS #1
-    if f[1].tag == asn1::OCTET_STRING { return load_ec(s, d, top, 0); }   // SEC 1
-    return false;
 }
 
 // One connection, either side.
@@ -467,11 +392,11 @@ fn offered_scheme(list: const u16[:], s: u16) -> bool {
 // The scheme the server signs with, for its key and the client's list; 0
 // for none.
 fn pick_scheme(cfg: const ServerConfig&, peer: const u16[:]) -> u16 {
-    if cfg.key_type == x509::KEY_ED25519 && offered_scheme(peer, x509::ED25519) { return x509::ED25519; }
-    if cfg.key_type == x509::KEY_EC_P256 && offered_scheme(peer, x509::ECDSA_SECP256R1_SHA256) { return x509::ECDSA_SECP256R1_SHA256; }
-    if cfg.key_type == x509::KEY_EC_P384 && offered_scheme(peer, x509::ECDSA_SECP384R1_SHA384) { return x509::ECDSA_SECP384R1_SHA384; }
-    if cfg.key_type == x509::KEY_EC_P521 && offered_scheme(peer, x509::ECDSA_SECP521R1_SHA512) { return x509::ECDSA_SECP521R1_SHA512; }
-    if cfg.key_type == x509::KEY_RSA {
+    if cfg.key.kind == x509::KEY_ED25519 && offered_scheme(peer, x509::ED25519) { return x509::ED25519; }
+    if cfg.key.kind == x509::KEY_EC_P256 && offered_scheme(peer, x509::ECDSA_SECP256R1_SHA256) { return x509::ECDSA_SECP256R1_SHA256; }
+    if cfg.key.kind == x509::KEY_EC_P384 && offered_scheme(peer, x509::ECDSA_SECP384R1_SHA384) { return x509::ECDSA_SECP384R1_SHA384; }
+    if cfg.key.kind == x509::KEY_EC_P521 && offered_scheme(peer, x509::ECDSA_SECP521R1_SHA512) { return x509::ECDSA_SECP521R1_SHA512; }
+    if cfg.key.kind == x509::KEY_RSA {
         for s in [x509::RSA_PSS_RSAE_SHA256, x509::RSA_PSS_RSAE_SHA384, x509::RSA_PSS_RSAE_SHA512] {
             if offered_scheme(peer, s) { return s; }
         }
@@ -480,19 +405,12 @@ fn pick_scheme(cfg: const ServerConfig&, peer: const u16[:]) -> u16 {
 }
 
 fn sign(cfg: const ServerConfig&, scheme: u16, msg: const u8[:]) -> u8[>..] {
-    var out: u8[>..] = [];
-    if scheme == x509::ED25519 {
-        out.append(bignum::ed25519_sign(cfg.ed_seed, msg));
-    } else if scheme == x509::ECDSA_SECP256R1_SHA256 || scheme == x509::ECDSA_SECP384R1_SHA384
-              || scheme == x509::ECDSA_SECP521R1_SHA512 {
-        let curve = if scheme == x509::ECDSA_SECP256R1_SHA256 { bignum::p256() }
-                    else if scheme == x509::ECDSA_SECP384R1_SHA384 { bignum::p384() } else { bignum::p521() };
-        out = bignum::ecdsa_sig_to_der(bignum::ecdsa_sign(curve, cfg.ec_sk, msg));
-    } else {
-        let h = if scheme == x509::RSA_PSS_RSAE_SHA256 { 256 } else if scheme == x509::RSA_PSS_RSAE_SHA384 { 384 } else { 512 };
-        out = bignum::rsa_sign_pss(cfg.rsa, msg, -1, h);
-    }
-    return out;
+    if scheme == x509::ED25519 { return x509::sign(cfg.key, x509::SIG_ED25519, 0, msg); }
+    if scheme == x509::ECDSA_SECP256R1_SHA256 { return x509::sign(cfg.key, x509::SIG_ECDSA, 256, msg); }
+    if scheme == x509::ECDSA_SECP384R1_SHA384 { return x509::sign(cfg.key, x509::SIG_ECDSA, 384, msg); }
+    if scheme == x509::ECDSA_SECP521R1_SHA512 { return x509::sign(cfg.key, x509::SIG_ECDSA, 512, msg); }
+    let h = if scheme == x509::RSA_PSS_RSAE_SHA256 { 256 } else if scheme == x509::RSA_PSS_RSAE_SHA384 { 384 } else { 512 };
+    return x509::sign(cfg.key, x509::SIG_RSA_PSS, h, msg);
 }
 
 // The alert for a certificate the client refuses.
@@ -1152,8 +1070,7 @@ fn feed(c: Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&, input: c
 }
 
 fn no_server() -> ServerConfig {
-    ServerConfig { key_type: 0, ec_sk: [], ed_seed: [0; 32], rsa: empty_rsa(), groups: [], suites: [],
-                   alpn: [], seed: 0, chain: [] }
+    ServerConfig { key: x509::empty_key(), groups: [], suites: [], alpn: [], seed: 0, chain: [] }
 }
 
 fn no_client() -> ClientConfig {

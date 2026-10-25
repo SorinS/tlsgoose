@@ -139,9 +139,9 @@ fn main() {
     }
     // The native key formats load too.
     let sc_sec1, ok1 = tls::server_config(field("p256", 2), field("p256", 4));
-    check("sec1", ok1 && sc_sec1.key_type == x509::KEY_EC_P256);
+    check("sec1", ok1 && sc_sec1.key.kind == x509::KEY_EC_P256);
     let sc_pkcs1, ok2 = tls::server_config(field("rsa", 2), field("rsa", 4));
-    check("pkcs1", ok2 && sc_pkcs1.key_type == x509::KEY_RSA);
+    check("pkcs1", ok2 && sc_pkcs1.key.kind == x509::KEY_RSA);
     let bad_key, ok3 = tls::server_config(field("rsa", 2), "junk");
     check("bad key", !ok3);
 
