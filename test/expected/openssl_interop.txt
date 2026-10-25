@@ -1,0 +1,4 @@
+TLS_AES_128_GCM_SHA256: 2 client data records, 2 tickets
+TLS_AES_256_GCM_SHA384: 2 client data records, 2 tickets
+TLS_CHACHA20_POLY1305_SHA256: 2 client data records, 2 tickets
+openssl interop: 198 checks, 0 failed
