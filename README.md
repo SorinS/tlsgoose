@@ -71,7 +71,7 @@ EC, Ed25519), SEC 1 or PKCS #1 DER.
 | | Client | Server |
 |---|---|---|
 | Suites | all three, in `cfg.suites` order | its own order of preference |
-| Key exchange | X25519, P-256, P-384, P-521; a share for the first of `cfg.groups`, the others through HelloRetryRequest | its first group the client has a share for, else a HelloRetryRequest for its first group the client supports |
+| Key exchange | X25519MLKEM768 (post-quantum hybrid, the default), X25519, P-256, P-384, P-521. The client sends a share for the first of `cfg.groups` (plus, beside the hybrid, an X25519 share on the same key, as Go does) and reaches the others through HelloRetryRequest | its first group the client has a share for, else a HelloRetryRequest for its first group the client supports |
 | Certificates | checked by `x509::verify_chain`: chain to `cfg.roots`, name `cfg.server_name`, time `cfg.now` (0 for now); `cfg.verify = false` skips it | sends `cfg.chain`, signs CertificateVerify with RSA-PSS, ECDSA (P-256, P-384, P-521) or Ed25519 as its key and the client allow |
 | CertificateVerify | RSA-PSS, RSA PKCS #1 v1.5, ECDSA P-256/P-384/P-521, Ed25519 | |
 | ALPN | `cfg.alpn` offered | its first protocol the client offered, or `no_application_protocol` |
@@ -144,12 +144,16 @@ python3 scripts/run_tests.py --native   # also built with the C compiler
   certificate, no common suite or group, an ALPN mismatch, and a changed
   record. Input is also fed a byte at a time.
 
-`scripts/live_interop.py` runs live connections against OpenSSL (47
+`scripts/live_interop.py` runs live connections against OpenSSL (53
 cases). It builds `tools/peer.goose`, a peer driven over stdin and stdout,
 and relays its bytes to Python's ssl module through memory BIOs. It
 covers:
 - this client against an OpenSSL server, and this server against an
   OpenSSL client, for each certificate type, suite and group;
+- X25519MLKEM768 by default, alone, and after a HelloRetryRequest, in
+  both roles (so OpenSSL decapsulates this package's ML-KEM ciphertexts
+  and encapsulates to its keys), and the X25519 fallback for a server
+  without it;
 - a HelloRetryRequest in each direction (the OpenSSL client offers its
   post-quantum hybrid share first);
 - ALPN both ways, a KeyUpdate that OpenSSL answers, and close_notify;

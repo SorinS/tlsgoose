@@ -9,8 +9,9 @@
 //   tls::client_feed(c, cfg, input, out, app);       // until tls::connected(c)
 //   tls::send(c, "GET / HTTP/1.1\r\n...", out);
 //
-// Supported: the three cipher suites; X25519, P-256, P-384 and P-521 key
-// exchange with HelloRetryRequest; server certificates checked by x509
+// Supported: the three cipher suites; X25519MLKEM768 (post-quantum
+// hybrid), X25519, P-256, P-384 and P-521 key exchange with
+// HelloRetryRequest; server certificates checked by x509
 // (chain, host name, CertificateVerify) with RSA-PSS, RSA PKCS #1 v1.5,
 // ECDSA and Ed25519; ALPN; KeyUpdate; middlebox compatibility mode.
 // Not supported: PSK and resumption (tickets are accepted and dropped),
@@ -29,6 +30,7 @@ import bignum.x25519;
 import bignum.ec;
 import bignum.ed25519;
 import bignum.rsa;
+import bignum.mlkem;
 import bignum.hmac;
 import bignum.entropy;
 import asn1;
@@ -41,6 +43,9 @@ let GROUP_SECP256R1: u16 = 0x0017;
 let GROUP_SECP384R1: u16 = 0x0018;
 let GROUP_SECP521R1: u16 = 0x0019;
 let GROUP_X25519: u16 = 0x001d;
+// The hybrid of ML-KEM-768 and X25519 (draft-ietf-tls-ecdhe-mlkem), Go's
+// and OpenSSL's first choice.
+let GROUP_X25519MLKEM768: u16 = 0x11ec;
 
 // Extension types.
 let EXT_SERVER_NAME: u16 = 0;
@@ -91,7 +96,7 @@ struct ClientConfig {
 fn client_config(server_name: const u8[:], roots: const u8[:]) -> ClientConfig {
     var c = ClientConfig {
         server_name: [], verify: true, now: 0,
-        groups: [GROUP_X25519, GROUP_SECP256R1, GROUP_SECP384R1, GROUP_SECP521R1],
+        groups: [GROUP_X25519MLKEM768, GROUP_X25519, GROUP_SECP256R1, GROUP_SECP384R1, GROUP_SECP521R1],
         suites: [TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256],
         alpn: [], seed: 0, roots: [],
     };
@@ -122,7 +127,7 @@ fn server_config(chain: const u8[:], key_der: const u8[:]) -> ServerConfig, bool
     let k, ok = x509::parse_private_key(key_der);
     var s = ServerConfig {
         key: k,
-        groups: [GROUP_X25519, GROUP_SECP256R1, GROUP_SECP384R1, GROUP_SECP521R1],
+        groups: [GROUP_X25519MLKEM768, GROUP_X25519, GROUP_SECP256R1, GROUP_SECP384R1, GROUP_SECP521R1],
         suites: [TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256],
         alpn: [], seed: 0, chain: [],
     };
@@ -139,7 +144,8 @@ struct Conn {
     read: RecordKeys, write: RecordKeys, read_protected: bool, write_protected: bool,
     drbg_k: u8[32], drbg_v: u8[32],
     random: u8[32], session_id: u8[..32],
-    group: u16, x25519_sk: u8[32], ec_sk: u8[..66],
+    group: u16, group2: u16,          // the share's group, and a second share's (X25519 beside the hybrid)
+    x25519_sk: u8[32], ec_sk: u8[..66], mlkem_seed: u8[64],
     hrr: bool, ccs_sent: bool, cert_requested: bool, cr_context: u8[..255],
     peer_schemes: u16[..32], alpn: u8[..255], sni: u8[..255],
     tickets: i64, key_updates: i64,
@@ -159,7 +165,7 @@ fn new_conn(is_server: bool, seed: u64) -> Conn {
         suite: s, sch: schedule(256, ""), th: transcript(256),
         read: record_keys(s, zero), write: record_keys(s, zero), read_protected: false, write_protected: false,
         drbg_k: [0; 32], drbg_v: [1; 32], random: [0; 32], session_id: [],
-        group: 0, x25519_sk: [0; 32], ec_sk: [], hrr: false, ccs_sent: false, cert_requested: false,
+        group: 0, group2: 0, x25519_sk: [0; 32], ec_sk: [], mlkem_seed: [0; 64], hrr: false, ccs_sent: false, cert_requested: false,
         cr_context: [], peer_schemes: [], alpn: [], sni: [], tickets: 0, key_updates: 0,
         ch: [], inbuf: [], hs: [], chain: [],
     };
@@ -333,10 +339,19 @@ fn curve_of(group: u16) -> bignum::Curve {
     if group == GROUP_SECP256R1 { bignum::p256() } else if group == GROUP_SECP384R1 { bignum::p384() } else { bignum::p521() }
 }
 
-// A fresh share for `group`: the public value to send.
+// A fresh share for `group`: the public value to send. The hybrid's is
+// the ML-KEM-768 encapsulation key, then the X25519 public key.
 fn make_share(c: Conn&, group: u16) -> u8[>..] {
     var out: u8[>..] = [];
     c.group = group;
+    if group == GROUP_X25519MLKEM768 {
+        drbg_fill(c, c.mlkem_seed);
+        let ek, dk = bignum::mlkem_keys_from_seed(3, c.mlkem_seed);
+        out.append(ek);
+        drbg_fill(c, c.x25519_sk);
+        out.append(bignum::x25519_base(c.x25519_sk));
+        return out;
+    }
     if group == GROUP_X25519 {
         drbg_fill(c, c.x25519_sk);
         out.append(bignum::x25519_base(c.x25519_sk));
@@ -355,9 +370,19 @@ fn make_share(c: Conn&, group: u16) -> u8[>..] {
     return bignum::ec_public_key(curve, sk);
 }
 
-// The shared secret from the peer's share, and false for a bad share.
+// The shared secret from the peer's share, and false for a bad share. A
+// client's for the hybrid: the ML-KEM secret of the server's ciphertext,
+// then the X25519 secret.
 fn shared_secret(c: const Conn&, peer: const u8[:]) -> u8[>..], bool {
     var out: u8[>..] = [];
+    if c.group == GROUP_X25519MLKEM768 {
+        if peer.len != 1088 + 32 { return out, false; }
+        let s1, ok1 = bignum::mlkem_decaps(3, c.mlkem_seed, peer[..1088]);
+        let s2, ok2 = bignum::x25519_shared(c.x25519_sk, peer[1088..]);
+        out.append(s1);
+        out.append(s2);
+        return out, ok1 && ok2;
+    }
     if c.group == GROUP_X25519 {
         if peer.len != 32 { return out, false; }
         let s, ok = bignum::x25519_shared(c.x25519_sk, peer);
@@ -370,7 +395,34 @@ fn shared_secret(c: const Conn&, peer: const u8[:]) -> u8[>..], bool {
     return out, ok;
 }
 
-fn known_group(g: i64) -> bool { g == GROUP_X25519 || g == GROUP_SECP256R1 || g == GROUP_SECP384R1 || g == GROUP_SECP521R1 }
+fn known_group(g: i64) -> bool {
+    g == GROUP_X25519 || g == GROUP_SECP256R1 || g == GROUP_SECP384R1 || g == GROUP_SECP521R1 || g == GROUP_X25519MLKEM768
+}
+
+// The server's share and the shared secret, from the client's share. For
+// the hybrid the server encapsulates to the client's ML-KEM key: its share
+// is the ciphertext and its X25519 public key.
+fn server_share(c: Conn&, group: u16, peer: const u8[:]) -> u8[>..], u8[>..], bool {
+    if group != GROUP_X25519MLKEM768 {
+        let mine = make_share(c, group);
+        let shared, ok = shared_secret(c, peer);
+        return mine, shared, ok;
+    }
+    c.group = group;
+    var share: u8[>..] = [];
+    var shared: u8[>..] = [];
+    if peer.len != 1184 + 32 { return share, shared, false; }
+    var m: u8[32] = [0; 32];
+    drbg_fill(c, m);
+    let s1, ct, ok1 = bignum::mlkem_encaps_with(3, peer[..1184], m);
+    drbg_fill(c, c.x25519_sk);
+    let s2, ok2 = bignum::x25519_shared(c.x25519_sk, peer[1184..]);
+    share.append(ct);
+    share.append(bignum::x25519_base(c.x25519_sk));
+    shared.append(s1);
+    shared.append(s2);
+    return share, shared, ok1 && ok2;
+}
 
 // --- Signatures -------------------------------------------------------------
 
@@ -465,6 +517,19 @@ fn build_client_hello(c: Conn&, cfg: const ClientConfig&, share_group: u16, cook
     let pubkey = make_share(c, share_group);
     put_u16(b, pubkey.len as! u16);
     b.append(pubkey);
+    // Beside the hybrid, an X25519 share with the same key (as Go sends),
+    // for servers without ML-KEM.
+    c.group2 = 0;
+    if share_group == GROUP_X25519MLKEM768 {
+        var wants_x25519 = false;
+        for g in cfg.groups { if g == GROUP_X25519 { wants_x25519 = true; } }
+        if wants_x25519 {
+            put_u16(b, GROUP_X25519);
+            put_u16(b, 32);
+            b.append(bignum::x25519_base(c.x25519_sk));
+            c.group2 = GROUP_X25519;
+        }
+    }
     patch_len(b, kl, 2);
     patch_len(b, ks, 2);
     if cfg.alpn.len > 0 {
@@ -539,7 +604,9 @@ fn client_server_hello(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: 
     if is_hrr {
         var known = false;
         for g in cfg.groups { if g == share_group { known = true; } }
-        if c.hrr || !known || share_group == c.group { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
+        if c.hrr || !known || share_group == c.group || share_group == c.group2 {
+            return fail(c, ALERT_ILLEGAL_PARAMETER, out);
+        }
         c.hrr = true;
         c.suite = s;
         c.th = transcript(s.hash);
@@ -553,6 +620,7 @@ fn client_server_hello(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: 
         send_hs(c, ch2, out);
         return 0;
     }
+    if c.group2 != 0 && share_group == c.group2 { c.group = c.group2; }
     if share_group != c.group || share.bad { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
     let shared, okx = shared_secret(c, m[share.pos..share.end]);
     if !okx { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
@@ -879,8 +947,7 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
     }
     transcript_add(c.th, m);
     // ServerHello and the key schedule.
-    let mine = make_share(c, group);
-    let shared, okx = shared_secret(c, m[share.pos..share.end]);
+    let mine, shared, okx = server_share(c, group, m[share.pos..share.end]);
     if !okx { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
     drbg_fill(c, c.random);
     send_server_hello(c, c.random, mine, false, out);

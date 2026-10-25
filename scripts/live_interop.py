@@ -26,7 +26,7 @@ ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 VEC = os.path.join(ROOT, "test", "vectors")
 SUITES = {"1301": "TLS_AES_128_GCM_SHA256", "1302": "TLS_AES_256_GCM_SHA384",
           "1303": "TLS_CHACHA20_POLY1305_SHA256"}
-GROUPS = {"001d": "X25519", "0017": "P-256", "0018": "P-384", "0019": "P-521"}
+GROUPS = {"001d": "X25519", "0017": "P-256", "0018": "P-384", "0019": "P-521", "11ec": "X25519MLKEM768"}
 
 
 class Peer:
@@ -48,8 +48,8 @@ class Peer:
             elif kind == "APP":
                 app += bytes.fromhex(rest)
             elif kind == "STATE":
-                st, alert, alpn = rest.split()
-                self.state = (int(st), int(alert), alpn)
+                st, alert, alpn, group = rest.split()
+                self.state = (int(st), int(alert), alpn, int(group))
 
     def cmd(self, line):
         self.p.stdin.write(line + "\n")
@@ -166,6 +166,16 @@ def main():
             cases.append(dict(name=f"goose {cert} server, {SUITES[s]}, {GROUPS[g]}", role="server",
                               cert=cert, goose_suites=[s], goose_groups=[g], want=True, suite=SUITES[s]))
     cases += [
+        dict(name="goose client, defaults: X25519MLKEM768", role="client", cert="p256", want=True, want_group=0x11ec),
+        dict(name="goose server, defaults: X25519MLKEM768", role="server", cert="ed25519", want=True, want_group=0x11ec),
+        dict(name="goose client, X25519MLKEM768 only", role="client", cert="rsa", goose_groups=["11ec"], want=True,
+             want_group=0x11ec),
+        dict(name="goose server, X25519MLKEM768 only", role="server", cert="p384", goose_groups=["11ec"], want=True,
+             want_group=0x11ec),
+        dict(name="goose client, HelloRetryRequest to X25519MLKEM768", role="client", cert="p256",
+             goose_groups=["0017", "11ec"], openssl_groups="X25519MLKEM768", want=True, want_group=0x11ec),
+        dict(name="goose client, OpenSSL without ML-KEM takes the X25519 share", role="client", cert="p256",
+             openssl_groups="X25519:P-256", want=True, want_group=0x001d),
         dict(name="goose client, HelloRetryRequest to P-384", role="client", cert="p256",
              goose_groups=["001d", "0018"], openssl_groups="P-384", want=True),
         dict(name="goose server, HelloRetryRequest from OpenSSL's shares", role="server", cert="p256",
@@ -205,6 +215,8 @@ def main():
             good = r.get("suite") == case["suite"]
         if good and case.get("want_alpn"):
             good = r.get("alpn") == case["want_alpn"]
+        if good and case.get("want_group"):
+            good = r.get("goose_state", [0, 0, 0, 0])[3] == case["want_group"]
         if good and case.get("goose_alert"):
             good = r.get("goose_state", [0, 0])[1] == case["goose_alert"]
         print(("ok    " if good else "FAIL  ") + case["name"] + ("" if good else f"  {r}"))

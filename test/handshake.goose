@@ -125,7 +125,7 @@ fn main() {
     let kinds = ["ed25519", "p256", "p384", "p521", "rsa"];
     let suites: u16[4] = [tls::TLS_AES_128_GCM_SHA256, tls::TLS_AES_256_GCM_SHA384, tls::TLS_CHACHA20_POLY1305_SHA256,
                           tls::TLS_AES_128_GCM_SHA256];
-    let groups: u16[4] = [tls::GROUP_X25519, tls::GROUP_SECP256R1, tls::GROUP_SECP384R1, tls::GROUP_SECP521R1];
+    let groups: u16[4] = [tls::GROUP_X25519MLKEM768, tls::GROUP_SECP256R1, tls::GROUP_SECP384R1, tls::GROUP_SECP521R1];
     for kind in kinds {
         let sc = server_cfg(kind);
         for si in 4 {
@@ -145,9 +145,48 @@ fn main() {
     let bad_key, ok3 = tls::server_config(field("rsa", 2), "junk");
     check("bad key", !ok3);
 
+    // The defaults: the hybrid, chosen over the X25519 share beside it.
+    var cd = client_cfg();
+    let sd = server_cfg("p256");
+    var c0 = tls::client(cd);
+    var s0 = tls::server(sd);
+    var ts: u8[>..] = [];
+    var ca0: u8[>..] = [];
+    var sa0: u8[>..] = [];
+    tls::client_start(c0, cd, ts);
+    pump(c0, cd, s0, sd, ts, ca0, sa0);
+    check("hybrid default", tls::connected(c0) && c0.group == tls::GROUP_X25519MLKEM768 && s0.group == tls::GROUP_X25519MLKEM768);
+    // A server without ML-KEM takes the X25519 share, with no retry.
+    var sx = server_cfg("p256");
+    sx.groups.clear();
+    sx.groups.push(tls::GROUP_X25519);
+    var c1 = tls::client(cd);
+    var s1 = tls::server(sx);
+    ts.clear();
+    tls::client_start(c1, cd, ts);
+    pump(c1, cd, s1, sx, ts, ca0, sa0);
+    check("x25519 beside the hybrid", tls::connected(c1) && c1.group == tls::GROUP_X25519 && !c1.hrr);
+    // A retry for the hybrid.
+    var cr = client_cfg();
+    cr.groups.clear();
+    cr.groups.push(tls::GROUP_SECP256R1);
+    cr.groups.push(tls::GROUP_X25519MLKEM768);
+    var sh = server_cfg("ed25519");
+    sh.groups.clear();
+    sh.groups.push(tls::GROUP_X25519MLKEM768);
+    var c2h = tls::client(cr);
+    var s2h = tls::server(sh);
+    ts.clear();
+    tls::client_start(c2h, cr, ts);
+    pump(c2h, cr, s2h, sh, ts, ca0, sa0);
+    check("hrr to the hybrid", tls::connected(c2h) && c2h.hrr && c2h.group == tls::GROUP_X25519MLKEM768);
+
     // HelloRetryRequest: the client's share is X25519, the server only
     // takes P-256.
     var cc = client_cfg();
+    cc.groups.clear();
+    cc.groups.push(tls::GROUP_X25519);
+    cc.groups.push(tls::GROUP_SECP256R1);
     var sc = server_cfg("p256");
     sc.groups.clear();
     sc.groups.push(tls::GROUP_SECP256R1);

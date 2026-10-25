@@ -8,7 +8,7 @@
 // <hex>" (application data), "KEYUPDATE", "CLOSE". After the client's
 // start and after each command the peer prints "OUT <hex>" if it has bytes
 // to send, "APP <hex>" if it received data, then "STATE <state> <alert>
-// <alpn>" and "END".
+// <alpn> <group>" and "END".
 import std;
 import os;
 import tls from "..";
@@ -46,7 +46,7 @@ fn pem_der(path: const u8[:], label: const u8[:]) -> u8[>..] {
 fn report(c: const tls::Conn&, out: const u8[:], app: const u8[:]) {
     if out.len > 0 { print("OUT ", hex(out)); }
     if app.len > 0 { print("APP ", hex(app)); }
-    print("STATE ", c.state, " ", c.alert, " ", if c.alpn.len > 0 { c.alpn[..] } else { "-" });
+    print("STATE ", c.state, " ", c.alert, " ", if c.alpn.len > 0 { c.alpn[..] } else { "-" }, " ", c.group);
     print("END");
     flush_stdout();
 }
