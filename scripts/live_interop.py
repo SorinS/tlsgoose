@@ -10,7 +10,8 @@ Cases: the Goose client against an OpenSSL server for each certificate
 type (ML-DSA ones included), cipher suite and group, with a HelloRetryRequest, ALPN, and a
 KeyUpdate; the Goose server against an OpenSSL client likewise (which
 offers its post-quantum hybrid first and so takes X25519 or a retry);
-roots from a directory; and failures: an untrusted root, the system's
+resumption both ways (also after a HelloRetryRequest); roots from a
+directory; and failures: an untrusted root, the system's
 roots (which lack the test root), and a wrong host name.
 
     python3 scripts/live_interop.py [--goose PATH]
@@ -35,6 +36,7 @@ class Peer:
     def __init__(self, exe, args):
         self.p = subprocess.Popen([exe, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.state = None
+        self.session = None
 
     def read(self):
         out, app = b"", b""
@@ -49,9 +51,11 @@ class Peer:
                 out += bytes.fromhex(rest)
             elif kind == "APP":
                 app += bytes.fromhex(rest)
+            elif kind == "SESSION":
+                self.session = None if rest == "-" else rest
             elif kind == "STATE":
-                st, alert, alpn, group = rest.split()
-                self.state = (int(st), int(alert), alpn, int(group))
+                st, alert, alpn, group, resumed = rest.split()
+                self.state = (int(st), int(alert), alpn, int(group), resumed == "1")
 
     def cmd(self, line):
         self.p.stdin.write(line + "\n")
@@ -63,9 +67,96 @@ class Peer:
         self.p.wait()
 
 
+def handshake(peer, obj, inc, outg, goose_is_client):
+    """Relays until both sides are done; whether they connected."""
+    import ssl
+    if goose_is_client:
+        out, app = peer.read()
+        inc.write(out)
+    done = False
+    for _ in range(30):
+        try:
+            obj.do_handshake()
+            done = True
+        except ssl.SSLWantReadError:
+            pass
+        data = outg.read()
+        if data:
+            out, app = peer.cmd("IN " + data.hex())
+            if out:
+                inc.write(out)
+        elif done and peer.state[0] == 20:
+            break
+        elif peer.state[0] >= 21:
+            break
+    return done and peer.state[0] == 20
+
+
+def exchange(peer, obj, inc, outg):
+    """Data both ways, which also delivers the session tickets."""
+    import ssl
+    out, _ = peer.cmd("SEND " + b"ping".hex())
+    inc.write(out)
+    got = obj.read(100)
+    obj.write(b"pong")
+    data = outg.read()
+    _, app = peer.cmd("IN " + data.hex())
+    if app != b"pong":       # OpenSSL's tickets may come first, in their own records
+        while not app.endswith(b"pong"):
+            _, more = peer.cmd("IN ")
+            app += more
+            if not more:
+                break
+    return got == b"ping" and app.endswith(b"pong")
+
+
+def run_resume_case(case):
+    """In the child: two connections, the second resuming the first's session."""
+    import ssl
+    exe = case["exe"]
+    goose_is_client = case["role"] == "client"
+    if goose_is_client:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(os.path.join(VEC, f"hs_{case['cert']}.pem"), os.path.join(VEC, f"hs_{case['cert']}.key"))
+    else:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.load_verify_locations(os.path.join(VEC, "hs_root.pem"))
+    ctx.minimum_version = ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+    key = os.urandom(32).hex()
+    session, py_session = None, None
+    result = {"ok": False, "resumed": []}
+    for round in range(2):
+        inc, outg = ssl.MemoryBIO(), ssl.MemoryBIO()
+        if goose_is_client:
+            obj = ctx.wrap_bio(inc, outg, server_side=True)
+            args = ["client", "example.com", os.path.join(VEC, "hs_root.pem")]
+            if session:
+                args += ["--session", session]
+        else:
+            obj = ctx.wrap_bio(inc, outg, server_side=False, server_hostname="example.com", session=py_session)
+            args = ["server", os.path.join(VEC, f"hs_{case['cert']}.pem"), os.path.join(VEC, f"hs_{case['cert']}.key"),
+                    "--ticket-key", key]
+        for g in case.get("goose_groups", []):
+            args += ["--group", g]
+        peer = Peer(exe, args)
+        if not handshake(peer, obj, inc, outg, goose_is_client) or not exchange(peer, obj, inc, outg):
+            result["state"] = peer.state
+            peer.close()
+            return result
+        result["resumed"].append([peer.state[4], obj.session_reused])
+        peer.cmd("SESSION")
+        session = peer.session
+        py_session = obj.session
+        peer.close()
+    result["ok"] = result["resumed"] == [[False, False], [True, True]]
+    return result
+
+
 def run_case(case):
     """In the child: one connection, returns a result dict."""
     import ssl
+    if case.get("resume"):
+        return run_resume_case(case)
     exe = case["exe"]
     goose_is_client = case["role"] == "client"
     if goose_is_client:
@@ -204,6 +295,13 @@ def main():
              goose_alert=42),
         dict(name="goose client, untrusted root", role="client", cert="p256",
              roots=os.path.join(VEC, "hs_p384.pem"), want=False, goose_alert=48),
+        dict(name="goose client resumes with OpenSSL's ticket", role="client", cert="p256", resume=True, want=True),
+        dict(name="OpenSSL client resumes with this server's ticket", role="server", cert="ed25519", resume=True,
+             want=True),
+        dict(name="goose client resumes after a HelloRetryRequest", role="client", cert="rsa", resume=True,
+             goose_groups=["0018", "001d"], openssl_groups="X25519", want=True),
+        dict(name="OpenSSL client resumes after a HelloRetryRequest", role="server", cert="p384", resume=True,
+             goose_groups=["0019"], want=True),
         dict(name="goose client, roots from a directory", role="client", cert="mldsa65", roots=VEC, want=True),
         dict(name="goose client, system roots (no test root)", role="client", cert="p256", roots="system",
              want=False, goose_alert=48),

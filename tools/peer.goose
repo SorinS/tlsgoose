@@ -5,10 +5,13 @@
 //   peer server <chain.pem> <key.pem> [--suite ...] [--group ...] [--alpn ...]
 //
 // Commands, one per line: "IN <hex>" (bytes from the network), "SEND
-// <hex>" (application data), "KEYUPDATE", "CLOSE". After the client's
+// <hex>" (application data), "KEYUPDATE", "CLOSE", "SESSION" (the
+// client's latest session, as tls::session_bytes). After the client's
 // start and after each command the peer prints "OUT <hex>" if it has bytes
-// to send, "APP <hex>" if it received data, then "STATE <state> <alert>
-// <alpn> <group>" and "END".
+// to send, "APP <hex>" if it received data, "SESSION <hex|->" when asked,
+// then "STATE <state> <alert> <alpn> <group> <resumed>" and "END".
+// --session <hex> gives the client a session to resume, --ticket-key
+// <hex> the server its ticket key.
 import std;
 import os;
 import tls from "..";
@@ -16,6 +19,7 @@ import bignum from "../../bigmongoose.git";
 import asn1 from "../../asn1goose.git";
 import x509 from "../../x509goose.git";
 import tls.handshake;
+import tls.session;
 import x509.pool;
 
 fn hex(b: const u8[:]) -> u8[>..] {
@@ -47,7 +51,8 @@ fn pem_der(path: const u8[:], label: const u8[:]) -> u8[>..] {
 fn report(c: const tls::Conn&, out: const u8[:], app: const u8[:]) {
     if out.len > 0 { print("OUT ", hex(out)); }
     if app.len > 0 { print("APP ", hex(app)); }
-    print("STATE ", c.state, " ", c.alert, " ", if c.alpn.len > 0 { c.alpn[..] } else { "-" }, " ", c.group);
+    print("STATE ", c.state, " ", c.alert, " ", if c.alpn.len > 0 { c.alpn[..] } else { "-" }, " ", c.group, " ",
+          if tls::resumed(c) { 1 } else { 0 });
     print("END");
     flush_stdout();
 }
@@ -90,6 +95,13 @@ fn main() {
         } else if a[i] == "--alpn" {
             tls::add_alpn(cc.alpn, a[i + 1]);
             tls::add_alpn(sc.alpn, a[i + 1]);
+        } else if a[i] == "--session" {
+            let sess, ok = tls::parse_session(unhex(a[i + 1]));
+            if !ok { write_stderr("bad session\n"); assert(false); }
+            cc.session = sess;
+        } else if a[i] == "--ticket-key" {
+            let k = unhex(a[i + 1]);
+            for j in 32 { sc.ticket_key[j] = k[j]; }
         } else if a[i] == "--now" {
             let v, ok = parse_int(a[i + 1], 10);
             cc.now = v;
@@ -116,6 +128,10 @@ fn main() {
             let ok = tls::key_update(c, true, out);
         } else if line == "CLOSE" {
             tls::close(c, out);
+        } else if line == "SESSION" {
+            let sess, has = tls::session(c);
+            let text: u8[>..] = if has { hex(tls::session_bytes(sess)) } else { "-" };
+            print("SESSION ", text);
         }
         report(c, out, app);
         line.clear();

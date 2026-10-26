@@ -14,10 +14,10 @@
 // P-384 and P-521 key exchange with
 // HelloRetryRequest; server certificates checked by x509
 // (chain, host name, CertificateVerify) with RSA-PSS, RSA PKCS #1 v1.5,
-// ECDSA and Ed25519; ALPN; KeyUpdate; middlebox compatibility mode.
-// Not supported: PSK and resumption (tickets are accepted and dropped),
-// 0-RTT, client certificates (a request is answered with none), and TLS
-// below 1.3.
+// ECDSA, Ed25519 and ML-DSA; ALPN; KeyUpdate; middlebox compatibility
+// mode; resumption with tickets (psk_dhe_ke, tls.session).
+// Not supported: 0-RTT, external PSKs, client certificates (a request is
+// answered with none), and TLS below 1.3.
 
 namespace tls;
 
@@ -39,6 +39,7 @@ import x509;
 import x509.verify;
 import x509.pool;
 import x509.keys;
+import session;
 
 // Named groups and the signature schemes this package signs and verifies.
 let GROUP_SECP256R1: u16 = 0x0017;
@@ -62,6 +63,10 @@ let EXT_ALPN: u16 = 16;
 let EXT_SUPPORTED_VERSIONS: u16 = 43;
 let EXT_COOKIE: u16 = 44;
 let EXT_KEY_SHARE: u16 = 51;
+let EXT_PRE_SHARED_KEY: u16 = 41;
+let EXT_EARLY_DATA: u16 = 42;
+let EXT_PSK_KEY_EXCHANGE_MODES: u16 = 45;
+let PSK_DHE_KE: u8 = 1;
 
 // Connection states.
 let ST_START: i64 = 0;
@@ -94,12 +99,14 @@ let MAX_HANDSHAKE: i64 = 65536;
 // What a client needs: the name it connects to (SNI and the certificate
 // check), whether to check the certificate, the time for that check (0:
 // now), its groups (the first gets a key share), suites and ALPN
-// protocols, a DRBG seed for tests (0: the OS's entropy), and the trusted
-// roots: the system's (x509::system_roots), or a pool of its own when
-// system_roots is false.
+// protocols, a DRBG seed for tests (0: the OS's entropy), a session to
+// resume (from tls::session of an earlier connection; none when its
+// ticket is empty), and the trusted roots: the system's
+// (x509::system_roots), or a pool of its own when system_roots is false.
 struct ClientConfig {
     server_name: u8[..255], verify: bool, now: i64,
     groups: u16[..8], suites: u16[..8], alpn: u8[..255], seed: u64,
+    session: Session,
     system_roots: bool,
     roots: x509::CertPool,
 }
@@ -112,7 +119,7 @@ fn client_config(server_name: const u8[:], roots: const u8[:]) -> ClientConfig {
         groups: [GROUP_X25519MLKEM768, GROUP_SECP256R1MLKEM768, GROUP_SECP384R1MLKEM1024, GROUP_X25519,
                  GROUP_SECP256R1, GROUP_SECP384R1, GROUP_SECP521R1],
         suites: [TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256],
-        alpn: [], seed: 0, system_roots: roots.len == 0, roots: x509::new_pool(),
+        alpn: [], seed: 0, session: no_session(), system_roots: roots.len == 0, roots: x509::new_pool(),
     };
     c.server_name.append(server_name);
     let ok = x509::pool_add_concatenated(c.roots, roots);
@@ -137,10 +144,15 @@ fn add_alpn(list: u8[..255]&, proto: const u8[:]) {
 
 // What a server needs: its private key (one of x509's KEY_* types), its
 // groups, suites and ALPN protocols in order of preference, a DRBG seed,
-// and its certificate chain as concatenated DER, the leaf first.
+// the time (0: now), how many session tickets to send after a handshake
+// (Go's one by default; 0 for none, which also refuses resumption) and the
+// key that seals them (random; give every server that should resume the
+// others' sessions the same one), and its certificate chain as
+// concatenated DER, the leaf first.
 struct ServerConfig {
     key: x509::PrivateKey,
-    groups: u16[..8], suites: u16[..8], alpn: u8[..255], seed: u64,
+    groups: u16[..8], suites: u16[..8], alpn: u8[..255], seed: u64, now: i64,
+    tickets: i64, ticket_key: u8[32],
     chain: u8[>..],
 }
 
@@ -153,8 +165,9 @@ fn server_config(chain: const u8[:], key_der: const u8[:]) -> ServerConfig, bool
         groups: [GROUP_X25519MLKEM768, GROUP_SECP256R1MLKEM768, GROUP_SECP384R1MLKEM1024, GROUP_X25519,
                  GROUP_SECP256R1, GROUP_SECP384R1, GROUP_SECP521R1],
         suites: [TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256],
-        alpn: [], seed: 0, chain: [],
+        alpn: [], seed: 0, now: 0, tickets: 1, ticket_key: [0; 32], chain: [],
     };
+    bignum::random_bytes(s.ticket_key);
     s.chain.append(chain);
     return s, ok;
 }
@@ -173,6 +186,10 @@ struct Conn {
     hrr: bool, ccs_sent: bool, cert_requested: bool, cr_context: u8[..255],
     peer_schemes: u16[..32], alpn: u8[..255], sni: u8[..255],
     tickets: i64, key_updates: i64,
+    psk_offered: bool, resumed: bool,  // the client offered its session; the PSK was accepted
+    psk_dhe: bool,                     // the client allows psk_dhe_ke, so takes tickets
+    peer_not_after: i64,               // the server certificate's notAfter, for sessions (0: unchecked)
+    has_session: bool, session: Session,   // the client's latest ticket
     ch: u8[..8192],                   // the client's first ClientHello, until the hash is known
     inbuf: u8[..16645],               // one record in arrival
     hs: u8[..65536],                  // handshake messages being reassembled
@@ -191,6 +208,7 @@ fn new_conn(is_server: bool, seed: u64) -> Conn {
         drbg_k: [0; 32], drbg_v: [1; 32], random: [0; 32], session_id: [],
         group: 0, group2: 0, x25519_sk: [0; 32], ec_sk: [], mlkem_seed: [0; 64], hrr: false, ccs_sent: false, cert_requested: false,
         cr_context: [], peer_schemes: [], alpn: [], sni: [], tickets: 0, key_updates: 0,
+        psk_offered: false, resumed: false, psk_dhe: false, peer_not_after: 0, has_session: false, session: no_session(),
         ch: [], inbuf: [], hs: [], chain: [],
     };
     var seed_bytes: u8[32] = [0; 32];
@@ -231,10 +249,20 @@ fn drbg_fill(c: Conn&, out: u8[:]) {
     drbg_update(c, "");
 }
 
+// The time, in milliseconds: the configuration's (seconds), else now.
+fn now_ms(configured: i64) -> i64 { if configured != 0 { configured * 1000 } else { time_ns() / 1000000 } }
+
 fn client(cfg: const ClientConfig&) -> Conn { new_conn(false, cfg.seed) }
 fn server(cfg: const ServerConfig&) -> Conn { new_conn(true, cfg.seed) }
 
 fn connected(c: const Conn&) -> bool { c.state == ST_CONNECTED }
+
+// Whether the connection resumed a session (no certificates were sent).
+fn resumed(c: const Conn&) -> bool { c.resumed }
+
+// The client's latest session ticket, to resume with later (set it as
+// ClientConfig.session); false before the server has sent one.
+fn session(c: const Conn&) -> Session, bool { return c.session, c.has_session; }
 fn failed(c: const Conn&) -> bool { c.state == ST_FAILED }
 fn closed(c: const Conn&) -> bool { c.state == ST_CLOSED }
 
@@ -635,8 +663,42 @@ fn build_client_hello(c: Conn&, cfg: const ClientConfig&, share_group: u16, cook
         b.append(cookie);
         patch_len(b, ck, 2);
     }
+    // psk_key_exchange_modes always, without which servers send no
+    // tickets (§4.2.9).
+    let pm = begin_ext(b, EXT_PSK_KEY_EXCHANGE_MODES);
+    b.push(1);
+    b.push(PSK_DHE_KE);
+    patch_len(b, pm, 2);
+    if !c.psk_offered {
+        patch_len(b, exts, 2);
+        return handshake_message(HS_CLIENT_HELLO, b);
+    }
+    // The session as a PSK: pre_shared_key, which must come last, its
+    // binder a placeholder until the rest is hashed (§4.2.11.2).
+    let sess = cfg.session;
+    let st, oks = suite(sess.suite);
+    let hl = hash_len(st);
+    let pk = begin_ext(b, EXT_PRE_SHARED_KEY);
+    let ids = begin_vec(b, 2);
+    put_u16(b, sess.ticket.len as! u16);
+    b.append(sess.ticket);
+    let age = obfuscated_age(sess, now_ms(cfg.now));
+    for i in 4 { b.push((age >> (8 * (3 - i))) as! u8); }
+    patch_len(b, ids, 2);
+    put_u16(b, (hl + 1) as! u16);
+    b.push(hl as! u8);
+    for i in hl { b.push(0); }
+    patch_len(b, pk, 2);
     patch_len(b, exts, 2);
-    return handshake_message(HS_CLIENT_HELLO, b);
+    var msg = handshake_message(HS_CLIENT_HELLO, b);
+    // The binder: over the transcript so far (after a HelloRetryRequest)
+    // and this ClientHello up to its binders.
+    var th = if c.hrr { c.th } else { transcript(st.hash) };
+    transcript_add(th, msg[..msg.len - 3 - hl]);
+    let early = schedule(st.hash, sess.psk);
+    let binder = finished_data(st.hash, binder_key(early, false), transcript_hash(th));
+    for i in hl { msg[msg.len - hl + i] = binder[i]; }
+    return msg;
 }
 
 // Sends the ClientHello.
@@ -646,6 +708,16 @@ fn client_start(c: Conn&, cfg: const ClientConfig&, out: u8[>..]&) {
     var sid: u8[32] = [0; 32];
     drbg_fill(c, sid);
     c.session_id.append(sid);                      // middlebox compatibility mode
+    // A session is offered when it is still good for this server and one of
+    // the suites offered has its hash.
+    c.psk_offered = false;
+    if session_usable(cfg.session, cfg.server_name, now_ms(cfg.now)) {
+        let st, oks = suite(cfg.session.suite);
+        for sid2 in cfg.suites {
+            let s2, ok2 = suite(sid2);
+            if oks && ok2 && s2.hash == st.hash { c.psk_offered = true; }
+        }
+    }
     let ch = build_client_hello(c, cfg, cfg.groups[0], "");
     c.ch.append(ch);
     out.append(plain_record(CT_HANDSHAKE, ch, 0x0301));
@@ -673,6 +745,7 @@ fn client_server_hello(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: 
     var share_group = -1;
     var share = Rd { pos: 0, end: 0, bad: false };
     var cookie = Rd { pos: 0, end: 0, bad: false };
+    var psk_selected = -1;
     while exts.pos < exts.end {
         let ty = get_u16(exts, m);
         var e = get_vec(exts, m, 2);
@@ -684,6 +757,8 @@ fn client_server_hello(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: 
             if !is_hrr { share = get_vec(e, m, 2); }
         } else if ty == EXT_COOKIE && is_hrr {
             cookie = get_vec(e, m, 2);
+        } else if ty == EXT_PRE_SHARED_KEY && !is_hrr && c.psk_offered {
+            psk_selected = get_u16(e, m);
         } else {
             return fail(c, ALERT_UNSUPPORTED_EXTENSION, out);
         }
@@ -700,6 +775,11 @@ fn client_server_hello(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: 
         }
         c.hrr = true;
         c.suite = s;
+        // The session stays on offer only under a suite of its hash.
+        if c.psk_offered {
+            let st, okst = suite(cfg.session.suite);
+            if st.hash != s.hash { c.psk_offered = false; }
+        }
         c.th = transcript(s.hash);
         transcript_add(c.th, c.ch);
         transcript_restart_hrr(c.th);
@@ -721,7 +801,15 @@ fn client_server_hello(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: 
         transcript_add(c.th, c.ch);
     }
     transcript_add(c.th, m);
-    c.sch = schedule(s.hash, "");
+    // The PSK, if the server took it: the one identity offered, under a
+    // suite of the session's hash.
+    if psk_selected >= 0 {
+        let st, okst = suite(cfg.session.suite);
+        if psk_selected != 0 || st.hash != s.hash { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
+        c.resumed = true;
+        c.peer_not_after = cfg.session.not_after;
+    }
+    c.sch = schedule(s.hash, if c.resumed { cfg.session.psk[..] } else { "" });
     schedule_handshake(c.sch, shared, transcript_hash(c.th));
     c.read = record_keys(s, c.sch.s_hs);
     c.read_protected = true;
@@ -759,7 +847,8 @@ fn client_encrypted_extensions(c: Conn&, cfg: const ClientConfig&, m: const u8[:
         }
     }
     transcript_add(c.th, m);
-    c.state = ST_WAIT_CERT_CR;
+    // Resumed, the server authenticates with the PSK alone.
+    c.state = if c.resumed { ST_WAIT_FINISHED } else { ST_WAIT_CERT_CR };
     return 0;
 }
 
@@ -794,6 +883,8 @@ fn client_certificate(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u
             c.error = e;
             return fail(c, cert_alert(e), out);
         }
+        let leaf, el = x509::parse(c.chain[..ct.end]);
+        c.peer_not_after = leaf.not_after;
     }
     transcript_add(c.th, m);
     c.state = ST_WAIT_CV;
@@ -867,16 +958,57 @@ fn client_message(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8[>.
     }
     if c.state == ST_WAIT_CV && t == HS_CERTIFICATE_VERIFY { return client_certificate_verify(c, m, out); }
     if c.state == ST_WAIT_FINISHED && t == HS_FINISHED { return client_finished(c, m, out); }
+    if c.state == ST_CONNECTED && t == HS_NEW_SESSION_TICKET { return client_ticket(c, cfg, m, out); }
     if c.state == ST_CONNECTED { return post_handshake(c, m, out); }
     return fail(c, ALERT_UNEXPECTED_MESSAGE, out);
+}
+
+// NewSessionTicket (§4.6.1): kept as the client's session, the PSK derived
+// from the resumption secret and the ticket's nonce. A ticket of lifetime 0,
+// or too long to keep, is dropped.
+fn client_ticket(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8[>..]&) -> i64 {
+    var b = Rd { pos: 4, end: m.len, bad: false };
+    let lifetime = get_u16(b, m) << 16 | get_u16(b, m);
+    let age_add = get_u16(b, m) << 16 | get_u16(b, m);
+    let nonce = get_vec(b, m, 1);
+    let ticket = get_vec(b, m, 2);
+    var exts = get_vec(b, m, 2);
+    if !done(b) || ticket.end == ticket.pos { return fail(c, ALERT_DECODE_ERROR, out); }
+    if lifetime > MAX_TICKET_LIFETIME { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
+    var max_early: i64 = 0;
+    while exts.pos < exts.end {
+        let ty = get_u16(exts, m);
+        var e = get_vec(exts, m, 2);
+        if ty == EXT_EARLY_DATA { max_early = get_u16(e, m) << 16 | get_u16(e, m); }
+        if exts.bad { return fail(c, ALERT_DECODE_ERROR, out); }
+    }
+    c.tickets++;
+    var s = no_session();
+    if lifetime == 0 || ticket.end - ticket.pos > s.ticket.cap { return 0; }
+    s.suite = c.suite.id;
+    s.psk.append(resumption_psk(c.suite.hash, c.sch.resumption, m[nonce.pos..nonce.end]));
+    s.age_add = age_add as! u32;
+    s.lifetime = lifetime;
+    s.received_ms = now_ms(cfg.now);
+    s.server_name.append(cfg.server_name);
+    s.alpn.append(c.alpn);
+    s.not_after = c.peer_not_after;
+    s.max_early_data = max_early as! u32;
+    s.ticket.append(m[ticket.pos..ticket.end]);
+    c.session = s;
+    c.has_session = true;
+    return 0;
 }
 
 // --- The server -------------------------------------------------------------
 
 // What a ClientHello offers, as offsets into it.
+// pre_shared_key's identities and binders, and where the binders start
+// (what they do not cover), with whether psk_dhe_ke is allowed.
 struct Hello {
     suites: Rd, groups: Rd, shares: Rd, schemes: Rd, sni: Rd, alpn: Rd, cookie: Rd,
     sid: Rd, random: Rd, has_versions13: bool, has_groups: bool, has_shares: bool, has_schemes: bool,
+    psk_ids: Rd, psk_binders: Rd, binders_at: i64, has_psk: bool, psk_dhe: bool,
 }
 
 fn empty_rd() -> Rd { Rd { pos: 0, end: 0, bad: false } }
@@ -886,6 +1018,7 @@ fn parse_hello(m: const u8[:]) -> Hello, bool {
         suites: empty_rd(), groups: empty_rd(), shares: empty_rd(), schemes: empty_rd(), sni: empty_rd(),
         alpn: empty_rd(), cookie: empty_rd(), sid: empty_rd(), random: empty_rd(),
         has_versions13: false, has_groups: false, has_shares: false, has_schemes: false,
+        psk_ids: empty_rd(), psk_binders: empty_rd(), binders_at: 0, has_psk: false, psk_dhe: false,
     };
     var b = Rd { pos: 4, end: m.len, bad: false };
     let ver = get_u16(b, m);
@@ -924,6 +1057,17 @@ fn parse_hello(m: const u8[:]) -> Hello, bool {
             h.alpn = get_vec(e, m, 2);
         } else if ty == EXT_COOKIE {
             h.cookie = get_vec(e, m, 2);
+        } else if ty == EXT_PSK_KEY_EXCHANGE_MODES {
+            var l = get_vec(e, m, 1);
+            while l.pos < l.end { if get_u8(l, m) == PSK_DHE_KE as i64 { h.psk_dhe = true; } }
+            if l.bad { return h, false; }
+        } else if ty == EXT_PRE_SHARED_KEY {
+            // The last extension (§4.2.11).
+            if exts.pos != exts.end { return h, false; }
+            h.psk_ids = get_vec(e, m, 2);
+            h.binders_at = e.pos;
+            h.psk_binders = get_vec(e, m, 2);
+            h.has_psk = true;
         }
         if e.bad { return h, false; }
     }
@@ -948,7 +1092,8 @@ fn in_u16_list(m: const u8[:], list: Rd, v: u16) -> bool {
     return false;
 }
 
-fn send_server_hello(c: Conn&, random: const u8[:], share: const u8[:], hrr: bool, out: u8[>..]&) {
+fn send_server_hello(c: Conn&, random: const u8[:], share: const u8[:], hrr: bool, out: u8[>..]&,
+                     psk_identity: i64 = -1) {
     var b: u8[>..] = [];
     put_u16(b, 0x0303);
     b.append(random);
@@ -967,6 +1112,11 @@ fn send_server_hello(c: Conn&, random: const u8[:], share: const u8[:], hrr: boo
         b.append(share);
     }
     patch_len(b, ks, 2);
+    if psk_identity >= 0 {
+        let pk = begin_ext(b, EXT_PRE_SHARED_KEY);
+        put_u16(b, psk_identity as! u16);
+        patch_len(b, pk, 2);
+    }
     patch_len(b, exts, 2);
     send_hs(c, handshake_message(HS_SERVER_HELLO, b), out);
 }
@@ -1018,7 +1168,6 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
     var sl = h.schemes;
     while sl.pos + 1 < sl.end && c.peer_schemes.len < c.peer_schemes.cap { c.peer_schemes.push(get_u16(sl, m) as! u16); }
     let scheme = pick_scheme(cfg, c.peer_schemes);
-    if scheme == 0 { return fail(c, ALERT_HANDSHAKE_FAILURE, out); }
     // ALPN: the server's first protocol the client offered.
     c.alpn.clear();
     if h.alpn.end > h.alpn.pos && cfg.alpn.len > 0 {
@@ -1042,14 +1191,50 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
         c.session_id.append(m[h.sid.pos..h.sid.end]);
         c.th = transcript(s.hash);
     }
+    // Resumption: the first identity that is a ticket of ours, unexpired,
+    // for a suite of this hash; its binder must then be right.
+    var psk: u8[>..] = [];
+    var psk_identity = -1;
+    c.psk_dhe = h.psk_dhe;
+    if h.has_psk && h.psk_dhe && cfg.tickets > 0 {
+        let now = now_ms(cfg.now) / 1000;
+        var ids = h.psk_ids;
+        var idx = 0;
+        while ids.pos < ids.end && psk_identity < 0 {
+            let id = get_vec(ids, m, 2);
+            let age = get_bytes(ids, 4);
+            if ids.bad { return fail(c, ALERT_DECODE_ERROR, out); }
+            let t, okt = open_ticket(cfg.ticket_key, m[id.pos..id.end]);
+            let ts, okts = suite(t.suite);
+            if okt && okts && ts.hash == s.hash && now >= t.created && now - t.created <= t.lifetime {
+                psk_identity = idx;
+                psk.append(t.psk);
+            }
+            idx++;
+        }
+        if psk_identity >= 0 {
+            var bl = h.psk_binders;
+            var binder = empty_rd();
+            for i in psk_identity + 1 { binder = get_vec(bl, m, 1); }
+            if bl.bad { return fail(c, ALERT_DECODE_ERROR, out); }
+            var th = c.th;
+            transcript_add(th, m[..h.binders_at]);
+            let early = schedule(s.hash, psk);
+            if !finished_ok(s.hash, binder_key(early, false), transcript_hash(th), m[binder.pos..binder.end]) {
+                return fail(c, ALERT_DECRYPT_ERROR, out);
+            }
+            c.resumed = true;
+        }
+    }
+    if !c.resumed && scheme == 0 { return fail(c, ALERT_HANDSHAKE_FAILURE, out); }
     transcript_add(c.th, m);
     // ServerHello and the key schedule.
     let mine, shared, okx = server_share(c, group, m[share.pos..share.end]);
     if !okx { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
     drbg_fill(c, c.random);
-    send_server_hello(c, c.random, mine, false, out);
+    send_server_hello(c, c.random, mine, false, out, psk_identity);
     if c.session_id.len > 0 { send_ccs(c, out); }
-    c.sch = schedule(s.hash, "");
+    c.sch = schedule(s.hash, psk);
     schedule_handshake(c.sch, shared, transcript_hash(c.th));
     c.write = record_keys(s, c.sch.s_hs);
     c.write_protected = true;
@@ -1068,6 +1253,20 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
     }
     patch_len(ee, exts, 2);
     send_hs(c, handshake_message(HS_ENCRYPTED_EXTENSIONS, ee), out);
+    if !c.resumed {
+        let e = send_certificate(c, cfg, scheme, out);
+        if e != 0 { return e; }
+    }
+    let fin = finished_data(s.hash, c.sch.s_hs, transcript_hash(c.th));
+    send_hs(c, handshake_message(HS_FINISHED, fin), out);
+    schedule_master(c.sch, transcript_hash(c.th));
+    c.write = record_keys(s, c.sch.s_ap);
+    c.state = ST_WAIT_CLIENT_FINISHED;
+    return 0;
+}
+
+// Certificate and CertificateVerify.
+fn send_certificate(c: Conn&, cfg: const ServerConfig&, scheme: u16, out: u8[>..]&) -> i64 {
     var cert: u8[>..] = [];
     cert.push(0);
     let list = begin_vec(cert, 3);
@@ -1089,12 +1288,38 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
     put_u16(cv, sig.len as! u16);
     cv.append(sig);
     send_hs(c, handshake_message(HS_CERTIFICATE_VERIFY, cv), out);
-    let fin = finished_data(s.hash, c.sch.s_hs, transcript_hash(c.th));
-    send_hs(c, handshake_message(HS_FINISHED, fin), out);
-    schedule_master(c.sch, transcript_hash(c.th));
-    c.write = record_keys(s, c.sch.s_ap);
-    c.state = ST_WAIT_CLIENT_FINISHED;
     return 0;
+}
+
+// A NewSessionTicket (§4.6.1) for the connection, sealed under the ticket
+// key; the server sends cfg.tickets of them after the handshake and may
+// send more at any time. False before the handshake is done.
+fn send_session_ticket(c: Conn&, cfg: const ServerConfig&, out: u8[>..]&) -> bool {
+    if c.state != ST_CONNECTED || !c.is_server { return false; }
+    let nonce: u8[1] = [c.tickets as! u8];
+    c.tickets++;
+    var age_add: u8[4] = [0; 4];
+    drbg_fill(c, age_add);
+    var tn: u8[12] = [0; 12];
+    drbg_fill(c, tn);
+    var t = TicketState { suite: c.suite.id, psk: [], created: now_ms(cfg.now) / 1000,
+                          age_add: (age_add[0] as u32) << 24 | (age_add[1] as u32) << 16 | (age_add[2] as u32) << 8 | age_add[3],
+                          lifetime: MAX_TICKET_LIFETIME, alpn: [], sni: [] };
+    t.psk.append(resumption_psk(c.suite.hash, c.sch.resumption, nonce));
+    t.alpn.append(c.alpn);
+    t.sni.append(c.sni);
+    let ticket = seal_ticket(cfg.ticket_key, tn, t);
+    var b: u8[>..] = [];
+    for i in 4 { b.push((MAX_TICKET_LIFETIME >> (8 * (3 - i))) as! u8); }
+    b.append(age_add);
+    b.push(1);
+    b.append(nonce);
+    put_u16(b, ticket.len as! u16);
+    b.append(ticket);
+    put_u16(b, 0);
+    // After the handshake, outside the transcript.
+    out.append(seal_records(c.write, CT_HANDSHAKE, handshake_message(HS_NEW_SESSION_TICKET, b)));
+    return true;
 }
 
 fn server_message(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: u8[>..]&) -> i64 {
@@ -1113,6 +1338,8 @@ fn server_message(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: u8[>.
         schedule_resumption(c.sch, transcript_hash(c.th));
         c.read = record_keys(c.suite, c.sch.c_ap);
         c.state = ST_CONNECTED;
+        // Tickets only for a client that can use them (§4.2.9).
+        if c.psk_dhe { for i in cfg.tickets { let ok = send_session_ticket(c, cfg, out); } }
         return 0;
     }
     if c.state == ST_CONNECTED { return post_handshake(c, m, out); }
@@ -1234,12 +1461,13 @@ fn feed(c: Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&, input: c
 }
 
 fn no_server() -> ServerConfig {
-    ServerConfig { key: x509::empty_key(), groups: [], suites: [], alpn: [], seed: 0, chain: [] }
+    ServerConfig { key: x509::empty_key(), groups: [], suites: [], alpn: [], seed: 0, now: 0, tickets: 0,
+                   ticket_key: [0; 32], chain: [] }
 }
 
 fn no_client() -> ClientConfig {
     ClientConfig { server_name: [], verify: false, now: 0, groups: [], suites: [], alpn: [], seed: 0,
-                   system_roots: false, roots: x509::new_pool() }
+                   session: no_session(), system_roots: false, roots: x509::new_pool() }
 }
 
 fn client_feed(c: Conn&, cfg: const ClientConfig&, input: const u8[:], out: u8[>..]&, app: u8[>..]&) -> i64 {

@@ -18,6 +18,8 @@ received. The caller owns the socket, or the pipe, or the test harness.
   restart.
 - **`tls.handshake`**: `Conn`, the client and server state machines,
   their configurations, and key loading.
+- **`tls.session`**: `Session`, what a client keeps to resume, as bytes
+  too, and the server's sealed tickets.
 - **`tls.record`**: plaintext and protected records, the per-record nonce,
   content-type hiding and padding, size limits with the alert each failure
   calls for, fragmenting long data, and framing records and handshake
@@ -77,7 +79,8 @@ EC, Ed25519, ML-DSA), SEC 1 or PKCS #1 DER.
 | Certificates | checked by `x509::verify_with_roots`: chain to `cfg.roots`, or to the system's roots when `cfg.system_roots`, name `cfg.server_name`, time `cfg.now` (0 for now); `cfg.verify = false` skips it | sends `cfg.chain`, signs CertificateVerify with RSA-PSS, ECDSA (P-256, P-384, P-521), Ed25519 or ML-DSA as its key and the client allow |
 | CertificateVerify | ML-DSA-44/65/87 (draft-ietf-tls-mldsa, offered first, as Go does), RSA-PSS, RSA PKCS #1 v1.5, ECDSA P-256/P-384/P-521, Ed25519 | |
 | ALPN | `cfg.alpn` offered | its first protocol the client offered, or `no_application_protocol` |
-| After the handshake | NewSessionTicket counted and dropped; KeyUpdate both ways (`key_update(c, request, out)`) | KeyUpdate |
+| Resumption | offers `cfg.session` when it is unexpired, for `cfg.server_name`, and one of `cfg.suites` has its hash (also after a HelloRetryRequest); `tls::session(c)` is the latest ticket's session | takes a ticket sealed under `cfg.ticket_key` that is unexpired and of the suite's hash, checking its binder; sends `cfg.tickets` tickets (1, as Go) to clients that allow psk_dhe_ke |
+| After the handshake | NewSessionTicket kept as the session; KeyUpdate both ways (`key_update(c, request, out)`) | KeyUpdate; `send_session_ticket(c, cfg, out)` for another ticket |
 
 Both sides use middlebox compatibility mode (a session ID and
 change_cipher_spec), reassemble handshake messages across records, insist
@@ -87,9 +90,39 @@ received, and `c.error` the x509 error behind a certificate alert. Every
 random value comes from an HMAC-DRBG seeded from the OS. A config's
 `seed` fixes it, for tests.
 
-Not supported: PSK, resumption and 0-RTT (tickets are ignored), client
-certificates (a request is answered with an empty Certificate), and TLS
-1.2 or older.
+Not supported: 0-RTT, external PSKs, client certificates (a request is
+answered with an empty Certificate), and TLS 1.2 or older.
+
+### Resumption
+
+Resumption works as in Go's crypto/tls, with PSK and (EC)DHE
+(psk_dhe_ke) and no 0-RTT:
+
+```goose
+var c = tls::client(cfg);  ...                  // a full handshake
+let sess, has = tls::session(c);                // after the server's ticket
+let saved = tls::session_bytes(sess);           // to keep across runs; tls::parse_session reads it
+var cfg2 = tls::client_config("example.com", "");
+cfg2.session = sess;                            // the next connection offers it
+...                                             // tls::resumed(c2) once connected
+```
+
+A `Session` holds what the client needs:
+- the suite, the PSK and the ticket, with its age_add, arrival time and
+  lifetime (at most 7 days);
+- the server name and ALPN protocol;
+- the certificate's notAfter, after which the session is not offered, as
+  in Go.
+
+A resumed connection skips the server's Certificate and
+CertificateVerify, so `c.chain` is empty.
+
+The server keeps nothing: each ticket seals the session's state (suite,
+PSK, creation time, age_add, ALPN, server name) with ChaCha20-Poly1305
+under `cfg.ticket_key`. That key is random per `server_config`, so share
+it to let several servers resume each other's sessions. A ticket it cannot
+open, from another suite's hash, or older than its lifetime gives a full
+handshake. A wrong binder fails the handshake with decrypt_error.
 
 ## The key schedule
 
@@ -146,7 +179,15 @@ python3 scripts/run_tests.py --native   # also built with the C compiler
   certificate, no common suite or group, an ALPN mismatch, and a changed
   record. Input is also fed a byte at a time.
 
-`scripts/live_interop.py` runs live connections against OpenSSL (69
+- `resumption`: a session from a full handshake resumes:
+  - under its suite and another of its hash, from a resumed connection's
+    own ticket, after a HelloRetryRequest, and from session bytes;
+  - with a full handshake instead under another hash, another ticket key,
+    a server without tickets, a ticket too old or changed;
+  - is not offered expired or for another name;
+  - a changed binder is refused.
+
+`scripts/live_interop.py` runs live connections against OpenSSL (73
 cases). It builds `tools/peer.goose`, a peer driven over stdin and stdout,
 and relays its bytes to Python's ssl module through memory BIOs. It
 covers:
@@ -163,8 +204,16 @@ covers:
 - a HelloRetryRequest in each direction (the OpenSSL client offers its
   post-quantum hybrid share first);
 - ALPN both ways, a KeyUpdate that OpenSSL answers, and close_notify;
+- resumption both ways, also after a HelloRetryRequest: the first
+  connection full and the second resumed, by both sides' account;
 - roots from a directory; an untrusted root, the system's roots (which lack
   the test root), and a wrong name.
+
+`scripts/go_interop.py` runs this package against Go's crypto/tls
+(`scripts/gointerop`, standard library only) over sockets on 127.0.0.1.
+It checks resumption both ways: this client with a Go server's ticket, and
+a Go client with a session cache against this server. Both sides must
+report the second connection resumed.
 
 The compiler is found as in bignum: `--goose`, `$GOOSE`, `goose` on PATH,
 then `../goose.git/build/goose`.
