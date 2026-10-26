@@ -137,6 +137,52 @@ fn main() {
             let ok = handshake_ok(kind, cc, sc);
         }
     }
+    // The other ML-KEM groups, each alone on both sides, and a hybrid's
+    // ECDH share taken by a server without ML-KEM.
+    let pq: u16[3] = [tls::GROUP_SECP256R1MLKEM768, tls::GROUP_SECP384R1MLKEM1024, tls::GROUP_MLKEM1024];
+    let classic: u16[3] = [tls::GROUP_SECP256R1, tls::GROUP_SECP384R1, 0];
+    for gi in 3 {
+        var cg = client_cfg();
+        cg.groups.clear();
+        cg.groups.push(pq[gi]);
+        var sg = server_cfg("p384");
+        sg.groups.clear();
+        sg.groups.push(pq[gi]);
+        var cq = tls::client(cg);
+        var sq = tls::server(sg);
+        var tq: u8[>..] = [];
+        var caq: u8[>..] = [];
+        var saq: u8[>..] = [];
+        tls::client_start(cq, cg, tq);
+        pump(cq, cg, sq, sg, tq, caq, saq);
+        check("ml-kem group", tls::connected(cq) && tls::connected(sq) && cq.group == pq[gi] && sq.group == pq[gi] &&
+              !cq.hrr && cq.sch.c_ap == sq.sch.c_ap);
+        if classic[gi] == 0 { continue; }
+        cg.groups.push(classic[gi]);
+        var sf = server_cfg("ed25519");
+        sf.groups.clear();
+        sf.groups.push(classic[gi]);
+        var cf = tls::client(cg);
+        var sff = tls::server(sf);
+        tq.clear();
+        tls::client_start(cf, cg, tq);
+        pump(cf, cg, sff, sf, tq, caq, saq);
+        check("ecdh beside the hybrid", tls::connected(cf) && cf.group == classic[gi] && !cf.hrr);
+    }
+    // The defaults offer the NIST hybrids; a server preferring one takes it
+    // through a retry.
+    var cn = client_cfg();
+    var sn = server_cfg("rsa");
+    sn.groups.clear();
+    sn.groups.push(tls::GROUP_SECP384R1MLKEM1024);
+    var c3 = tls::client(cn);
+    var s3 = tls::server(sn);
+    var t3: u8[>..] = [];
+    var ca3: u8[>..] = [];
+    var sa3: u8[>..] = [];
+    tls::client_start(c3, cn, t3);
+    pump(c3, cn, s3, sn, t3, ca3, sa3);
+    check("hrr to secp384r1mlkem1024", tls::connected(c3) && c3.hrr && c3.group == tls::GROUP_SECP384R1MLKEM1024);
     // The native key formats load too.
     let sc_sec1, ok1 = tls::server_config(field("p256", 2), field("p256", 4));
     check("sec1", ok1 && sc_sec1.key.kind == x509::KEY_EC_P256);

@@ -9,8 +9,9 @@
 //   tls::client_feed(c, cfg, input, out, app);       // until tls::connected(c)
 //   tls::send(c, "GET / HTTP/1.1\r\n...", out);
 //
-// Supported: the three cipher suites; X25519MLKEM768 (post-quantum
-// hybrid), X25519, P-256, P-384 and P-521 key exchange with
+// Supported: the three cipher suites; the post-quantum X25519MLKEM768,
+// SecP256r1MLKEM768, SecP384r1MLKEM1024 and MLKEM1024, and X25519, P-256,
+// P-384 and P-521 key exchange with
 // HelloRetryRequest; server certificates checked by x509
 // (chain, host name, CertificateVerify) with RSA-PSS, RSA PKCS #1 v1.5,
 // ECDSA and Ed25519; ALPN; KeyUpdate; middlebox compatibility mode.
@@ -46,6 +47,11 @@ let GROUP_X25519: u16 = 0x001d;
 // The hybrid of ML-KEM-768 and X25519 (draft-ietf-tls-ecdhe-mlkem), Go's
 // and OpenSSL's first choice.
 let GROUP_X25519MLKEM768: u16 = 0x11ec;
+// The NIST hybrids of the same draft, and ML-KEM-1024 alone
+// (draft-ietf-tls-mlkem), as Go has them.
+let GROUP_SECP256R1MLKEM768: u16 = 0x11eb;
+let GROUP_SECP384R1MLKEM1024: u16 = 0x11ed;
+let GROUP_MLKEM1024: u16 = 0x0202;
 
 // Extension types.
 let EXT_SERVER_NAME: u16 = 0;
@@ -96,7 +102,8 @@ struct ClientConfig {
 fn client_config(server_name: const u8[:], roots: const u8[:]) -> ClientConfig {
     var c = ClientConfig {
         server_name: [], verify: true, now: 0,
-        groups: [GROUP_X25519MLKEM768, GROUP_X25519, GROUP_SECP256R1, GROUP_SECP384R1, GROUP_SECP521R1],
+        groups: [GROUP_X25519MLKEM768, GROUP_SECP256R1MLKEM768, GROUP_SECP384R1MLKEM1024, GROUP_X25519,
+                 GROUP_SECP256R1, GROUP_SECP384R1, GROUP_SECP521R1],
         suites: [TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256],
         alpn: [], seed: 0, roots: [],
     };
@@ -127,7 +134,8 @@ fn server_config(chain: const u8[:], key_der: const u8[:]) -> ServerConfig, bool
     let k, ok = x509::parse_private_key(key_der);
     var s = ServerConfig {
         key: k,
-        groups: [GROUP_X25519MLKEM768, GROUP_X25519, GROUP_SECP256R1, GROUP_SECP384R1, GROUP_SECP521R1],
+        groups: [GROUP_X25519MLKEM768, GROUP_SECP256R1MLKEM768, GROUP_SECP384R1MLKEM1024, GROUP_X25519,
+                 GROUP_SECP256R1, GROUP_SECP384R1, GROUP_SECP521R1],
         suites: [TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256],
         alpn: [], seed: 0, chain: [],
     };
@@ -339,25 +347,38 @@ fn curve_of(group: u16) -> bignum::Curve {
     if group == GROUP_SECP256R1 { bignum::p256() } else if group == GROUP_SECP384R1 { bignum::p384() } else { bignum::p521() }
 }
 
-// A fresh share for `group`: the public value to send. The hybrid's is
-// the ML-KEM-768 encapsulation key, then the X25519 public key.
-fn make_share(c: Conn&, group: u16) -> u8[>..] {
-    var out: u8[>..] = [];
-    c.group = group;
-    if group == GROUP_X25519MLKEM768 {
-        drbg_fill(c, c.mlkem_seed);
-        let ek, dk = bignum::mlkem_keys_from_seed(3, c.mlkem_seed);
-        out.append(ek);
+// A group's ML-KEM parameter k (3 for ML-KEM-768, 4 for ML-KEM-1024), 0
+// for none, and its ECDH part: the group itself for the classical ones, 0
+// for MLKEM1024.
+fn mlkem_k(group: u16) -> i64 {
+    if group == GROUP_X25519MLKEM768 || group == GROUP_SECP256R1MLKEM768 { 3 }
+    else if group == GROUP_SECP384R1MLKEM1024 || group == GROUP_MLKEM1024 { 4 } else { 0 }
+}
+
+fn ecdh_part(group: u16) -> u16 {
+    if group == GROUP_X25519MLKEM768 { GROUP_X25519 }
+    else if group == GROUP_SECP256R1MLKEM768 { GROUP_SECP256R1 }
+    else if group == GROUP_SECP384R1MLKEM1024 { GROUP_SECP384R1 }
+    else if group == GROUP_MLKEM1024 { 0 } else { group }
+}
+
+// The length of an ECDH share, and of ML-KEM's encapsulation key and
+// ciphertext.
+fn ecdh_len(g: u16) -> i64 {
+    if g == 0 { 0 } else if g == GROUP_X25519 { 32 } else if g == GROUP_SECP256R1 { 65 }
+    else if g == GROUP_SECP384R1 { 97 } else { 133 }
+}
+
+fn mlkem_ek_len(k: i64) -> i64 { 384 * k + 32 }
+fn mlkem_ct_len(k: i64) -> i64 { if k == 3 { 1088 } else { 1568 } }
+
+// A fresh ECDH key for group g (X25519 or a NIST curve); its public value.
+fn make_ecdh(c: Conn&, g: u16) -> u8[>..] {
+    if g == GROUP_X25519 {
         drbg_fill(c, c.x25519_sk);
-        out.append(bignum::x25519_base(c.x25519_sk));
-        return out;
+        return bignum::x25519_base(c.x25519_sk);
     }
-    if group == GROUP_X25519 {
-        drbg_fill(c, c.x25519_sk);
-        out.append(bignum::x25519_base(c.x25519_sk));
-        return out;
-    }
-    let curve = curve_of(group);
+    let curve = curve_of(g);
     var sk: u8[>..] = [];
     sk.resize(curve.len, 0);
     loop {
@@ -370,58 +391,102 @@ fn make_share(c: Conn&, group: u16) -> u8[>..] {
     return bignum::ec_public_key(curve, sk);
 }
 
-// The shared secret from the peer's share, and false for a bad share. A
-// client's for the hybrid: the ML-KEM secret of the server's ciphertext,
-// then the X25519 secret.
-fn shared_secret(c: const Conn&, peer: const u8[:]) -> u8[>..], bool {
+fn ecdh_public(c: const Conn&, g: u16) -> u8[>..] {
+    if g == GROUP_X25519 { return bignum::x25519_base(c.x25519_sk); }
+    let curve = curve_of(g);
+    return bignum::ec_public_key(curve, c.ec_sk);
+}
+
+fn ecdh_secret(c: const Conn&, g: u16, peer: const u8[:]) -> u8[>..], bool {
     var out: u8[>..] = [];
-    if c.group == GROUP_X25519MLKEM768 {
-        if peer.len != 1088 + 32 { return out, false; }
-        let s1, ok1 = bignum::mlkem_decaps(3, c.mlkem_seed, peer[..1088]);
-        let s2, ok2 = bignum::x25519_shared(c.x25519_sk, peer[1088..]);
-        out.append(s1);
-        out.append(s2);
-        return out, ok1 && ok2;
-    }
-    if c.group == GROUP_X25519 {
-        if peer.len != 32 { return out, false; }
+    if peer.len != ecdh_len(g) { return out, false; }
+    if g == GROUP_X25519 {
         let s, ok = bignum::x25519_shared(c.x25519_sk, peer);
         out.append(s);
         return out, ok;
     }
-    let curve = curve_of(c.group);
+    let curve = curve_of(g);
     let s, ok = bignum::ecdh_shared(curve, c.ec_sk, peer);
     out.append(s);
     return out, ok;
 }
 
+// Joins a hybrid's two parts as draft-ietf-tls-ecdhe-mlkem orders them:
+// ML-KEM first for X25519MLKEM768, ECDH first for the NIST hybrids.
+fn hybrid_join(group: u16, kem: const u8[:], ecdh: const u8[:]) -> u8[>..] {
+    var out: u8[>..] = [];
+    if group == GROUP_X25519MLKEM768 { out.append(kem); out.append(ecdh); }
+    else { out.append(ecdh); out.append(kem); }
+    return out;
+}
+
+// Splits a hybrid share whose ML-KEM part is n bytes: the ML-KEM part,
+// then the ECDH part.
+fn hybrid_split(group: u16, share: const u8[:], n: i64) -> const u8[:], const u8[:] {
+    if group == GROUP_X25519MLKEM768 { return share[..n], share[n..]; }
+    let e = share.len - n;
+    return share[e..], share[..e];
+}
+
+// A fresh share for `group`: the public value to send. A hybrid's is the
+// ML-KEM encapsulation key and the ECDH public value; MLKEM1024's is the
+// encapsulation key alone.
+fn make_share(c: Conn&, group: u16) -> u8[>..] {
+    c.group = group;
+    let k = mlkem_k(group);
+    if k == 0 { return make_ecdh(c, group); }
+    drbg_fill(c, c.mlkem_seed);
+    let ek, dk = bignum::mlkem_keys_from_seed(k, c.mlkem_seed);
+    let g = ecdh_part(group);
+    var e: u8[>..] = [];
+    if g != 0 { e = make_ecdh(c, g); }
+    return hybrid_join(group, ek, e);
+}
+
+// The shared secret from the peer's share, and false for a bad share. A
+// client's for a hybrid: the ML-KEM secret of the server's ciphertext and
+// the ECDH secret, in the share's order.
+fn shared_secret(c: const Conn&, peer: const u8[:]) -> u8[>..], bool {
+    let k = mlkem_k(c.group);
+    if k == 0 { return ecdh_secret(c, c.group, peer); }
+    let g = ecdh_part(c.group);
+    var out: u8[>..] = [];
+    if peer.len != mlkem_ct_len(k) + ecdh_len(g) { return out, false; }
+    let ct, pe = hybrid_split(c.group, peer, mlkem_ct_len(k));
+    let s1, ok1 = bignum::mlkem_decaps(k, c.mlkem_seed, ct);
+    if g == 0 { out.append(s1); return out, ok1; }
+    let s2, ok2 = ecdh_secret(c, g, pe);
+    return hybrid_join(c.group, s1, s2), ok1 && ok2;
+}
+
 fn known_group(g: i64) -> bool {
-    g == GROUP_X25519 || g == GROUP_SECP256R1 || g == GROUP_SECP384R1 || g == GROUP_SECP521R1 || g == GROUP_X25519MLKEM768
+    g == GROUP_X25519 || g == GROUP_SECP256R1 || g == GROUP_SECP384R1 || g == GROUP_SECP521R1 ||
+        g == GROUP_X25519MLKEM768 || g == GROUP_SECP256R1MLKEM768 || g == GROUP_SECP384R1MLKEM1024 || g == GROUP_MLKEM1024
 }
 
 // The server's share and the shared secret, from the client's share. For
-// the hybrid the server encapsulates to the client's ML-KEM key: its share
-// is the ciphertext and its X25519 public key.
+// ML-KEM the server encapsulates to the client's key: its share is the
+// ciphertext, with its ECDH public value for a hybrid.
 fn server_share(c: Conn&, group: u16, peer: const u8[:]) -> u8[>..], u8[>..], bool {
-    if group != GROUP_X25519MLKEM768 {
+    let k = mlkem_k(group);
+    if k == 0 {
         let mine = make_share(c, group);
         let shared, ok = shared_secret(c, peer);
         return mine, shared, ok;
     }
     c.group = group;
+    let g = ecdh_part(group);
     var share: u8[>..] = [];
     var shared: u8[>..] = [];
-    if peer.len != 1184 + 32 { return share, shared, false; }
+    if peer.len != mlkem_ek_len(k) + ecdh_len(g) { return share, shared, false; }
+    let ek, pe = hybrid_split(group, peer, mlkem_ek_len(k));
     var m: u8[32] = [0; 32];
     drbg_fill(c, m);
-    let s1, ct, ok1 = bignum::mlkem_encaps_with(3, peer[..1184], m);
-    drbg_fill(c, c.x25519_sk);
-    let s2, ok2 = bignum::x25519_shared(c.x25519_sk, peer[1184..]);
-    share.append(ct);
-    share.append(bignum::x25519_base(c.x25519_sk));
-    shared.append(s1);
-    shared.append(s2);
-    return share, shared, ok1 && ok2;
+    let s1, ct, ok1 = bignum::mlkem_encaps_with(k, ek, m);
+    if g == 0 { share.append(ct); shared.append(s1); return share, shared, ok1; }
+    let mine = make_ecdh(c, g);
+    let s2, ok2 = ecdh_secret(c, g, pe);
+    return hybrid_join(group, ct, mine), hybrid_join(group, s1, s2), ok1 && ok2;
 }
 
 // --- Signatures -------------------------------------------------------------
@@ -517,17 +582,20 @@ fn build_client_hello(c: Conn&, cfg: const ClientConfig&, share_group: u16, cook
     let pubkey = make_share(c, share_group);
     put_u16(b, pubkey.len as! u16);
     b.append(pubkey);
-    // Beside the hybrid, an X25519 share with the same key (as Go sends),
-    // for servers without ML-KEM.
+    // Beside a hybrid, a share of its ECDH part with the same key (as Go
+    // sends), for servers without ML-KEM. Not after a HelloRetryRequest,
+    // which allows only the share it asked for.
     c.group2 = 0;
-    if share_group == GROUP_X25519MLKEM768 {
-        var wants_x25519 = false;
-        for g in cfg.groups { if g == GROUP_X25519 { wants_x25519 = true; } }
-        if wants_x25519 {
-            put_u16(b, GROUP_X25519);
-            put_u16(b, 32);
-            b.append(bignum::x25519_base(c.x25519_sk));
-            c.group2 = GROUP_X25519;
+    let fallback = ecdh_part(share_group);
+    if !c.hrr && mlkem_k(share_group) > 0 && fallback != 0 {
+        var wanted = false;
+        for g in cfg.groups { if g == fallback { wanted = true; } }
+        if wanted {
+            let e = ecdh_public(c, fallback);
+            put_u16(b, fallback);
+            put_u16(b, e.len as! u16);
+            b.append(e);
+            c.group2 = fallback;
         }
     }
     patch_len(b, kl, 2);

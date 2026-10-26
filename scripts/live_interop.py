@@ -26,7 +26,8 @@ ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 VEC = os.path.join(ROOT, "test", "vectors")
 SUITES = {"1301": "TLS_AES_128_GCM_SHA256", "1302": "TLS_AES_256_GCM_SHA384",
           "1303": "TLS_CHACHA20_POLY1305_SHA256"}
-GROUPS = {"001d": "X25519", "0017": "P-256", "0018": "P-384", "0019": "P-521", "11ec": "X25519MLKEM768"}
+GROUPS = {"001d": "X25519", "0017": "P-256", "0018": "P-384", "0019": "P-521", "11ec": "X25519MLKEM768",
+          "11eb": "SecP256r1MLKEM768", "11ed": "SecP384r1MLKEM1024", "0202": "MLKEM1024"}
 
 
 class Peer:
@@ -180,6 +181,17 @@ def main():
              goose_groups=["001d", "0018"], openssl_groups="P-384", want=True),
         dict(name="goose server, HelloRetryRequest from OpenSSL's shares", role="server", cert="p256",
              goose_groups=["0018"], want=True),
+    ]
+    for g in ("11eb", "11ed", "0202"):
+        cases.append(dict(name=f"goose client, {GROUPS[g]}", role="client", cert="p384", goose_groups=[g],
+                          openssl_groups=GROUPS[g], want=True, want_group=int(g, 16)))
+        cases.append(dict(name=f"goose server, {GROUPS[g]}", role="server", cert="rsa", goose_groups=[g],
+                          openssl_groups=GROUPS[g], want=True, want_group=int(g, 16)))
+    cases += [
+        dict(name="goose client, HelloRetryRequest to SecP384r1MLKEM1024", role="client", cert="p256",
+             openssl_groups="SecP384r1MLKEM1024", want=True, want_group=0x11ed),
+        dict(name="goose client, OpenSSL without ML-KEM takes the P-256 share", role="client", cert="ed25519",
+             goose_groups=["11eb", "0017"], openssl_groups="P-256", want=True, want_group=0x0017),
         dict(name="goose client, ALPN", role="client", cert="ed25519", goose_alpn=["h2", "http/1.1"],
              alpn=["http/1.1"], want=True, want_alpn="http/1.1"),
         dict(name="goose server, ALPN", role="server", cert="rsa", goose_alpn=["h2", "http/1.1"],
