@@ -37,6 +37,7 @@ import bignum.entropy;
 import asn1;
 import x509;
 import x509.verify;
+import x509.pool;
 import x509.keys;
 
 // Named groups and the signature schemes this package signs and verifies.
@@ -94,23 +95,36 @@ let MAX_HANDSHAKE: i64 = 65536;
 // check), whether to check the certificate, the time for that check (0:
 // now), its groups (the first gets a key share), suites and ALPN
 // protocols, a DRBG seed for tests (0: the OS's entropy), and the trusted
-// roots as concatenated DER.
+// roots: the system's (x509::system_roots), or a pool of its own when
+// system_roots is false.
 struct ClientConfig {
     server_name: u8[..255], verify: bool, now: i64,
     groups: u16[..8], suites: u16[..8], alpn: u8[..255], seed: u64,
-    roots: u8[>..],
+    system_roots: bool,
+    roots: x509::CertPool,
 }
 
+// A client trusting the given roots (DER certificates concatenated), or,
+// as Go does with no RootCAs, the system's when there are none.
 fn client_config(server_name: const u8[:], roots: const u8[:]) -> ClientConfig {
     var c = ClientConfig {
         server_name: [], verify: true, now: 0,
         groups: [GROUP_X25519MLKEM768, GROUP_SECP256R1MLKEM768, GROUP_SECP384R1MLKEM1024, GROUP_X25519,
                  GROUP_SECP256R1, GROUP_SECP384R1, GROUP_SECP521R1],
         suites: [TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256],
-        alpn: [], seed: 0, roots: [],
+        alpn: [], seed: 0, system_roots: roots.len == 0, roots: x509::new_pool(),
     };
     c.server_name.append(server_name);
-    c.roots.append(roots);
+    let ok = x509::pool_add_concatenated(c.roots, roots);
+    return c;
+}
+
+// A client trusting the roots of a pool (built from files or a directory
+// with x509::pool_add_file and pool_add_dir, say), and not the system's.
+fn client_config_pool(server_name: const u8[:], roots: const x509::CertPool&) -> ClientConfig {
+    var c = client_config(server_name, "");
+    c.system_roots = false;
+    c.roots = copy(roots);
     return c;
 }
 
@@ -769,7 +783,13 @@ fn client_certificate(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u
     if !okt { return fail(c, ALERT_BAD_CERTIFICATE, out); }
     if cfg.verify {
         let now = if cfg.now != 0 { cfg.now } else { time() as i64 };
-        let e = x509::verify_chain(c.chain[..ct.end], c.chain[ct.end..], cfg.roots, now, cfg.server_name);
+        var e = x509::OK;
+        if cfg.system_roots {
+            let es, found = x509::verify_with_system_roots(c.chain[..ct.end], c.chain[ct.end..], now, cfg.server_name);
+            e = es;
+        } else {
+            e = x509::verify_with_roots(c.chain[..ct.end], c.chain[ct.end..], cfg.roots, now, cfg.server_name);
+        }
         if e != x509::OK {
             c.error = e;
             return fail(c, cert_alert(e), out);
@@ -1218,7 +1238,8 @@ fn no_server() -> ServerConfig {
 }
 
 fn no_client() -> ClientConfig {
-    ClientConfig { server_name: [], verify: false, now: 0, groups: [], suites: [], alpn: [], seed: 0, roots: [] }
+    ClientConfig { server_name: [], verify: false, now: 0, groups: [], suites: [], alpn: [], seed: 0,
+                   system_roots: false, roots: x509::new_pool() }
 }
 
 fn client_feed(c: Conn&, cfg: const ClientConfig&, input: const u8[:], out: u8[>..]&, app: u8[>..]&) -> i64 {

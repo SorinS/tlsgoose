@@ -10,7 +10,8 @@ Cases: the Goose client against an OpenSSL server for each certificate
 type (ML-DSA ones included), cipher suite and group, with a HelloRetryRequest, ALPN, and a
 KeyUpdate; the Goose server against an OpenSSL client likewise (which
 offers its post-quantum hybrid first and so takes X25519 or a retry);
-and failures: an untrusted root and a wrong host name.
+roots from a directory; and failures: an untrusted root, the system's
+roots (which lack the test root), and a wrong host name.
 
     python3 scripts/live_interop.py [--goose PATH]
 """
@@ -203,6 +204,9 @@ def main():
              goose_alert=42),
         dict(name="goose client, untrusted root", role="client", cert="p256",
              roots=os.path.join(VEC, "hs_p384.pem"), want=False, goose_alert=48),
+        dict(name="goose client, roots from a directory", role="client", cert="mldsa65", roots=VEC, want=True),
+        dict(name="goose client, system roots (no test root)", role="client", cert="p256", roots="system",
+             want=False, goose_alert=48),
         dict(name="goose server, OpenSSL client checks the name", role="server", cert="p256",
              host="other.org", want=False),
     ]

@@ -1,7 +1,7 @@
 // A TLS peer driven over stdin and stdout, for scripts/live_interop.py:
 // the script relays the bytes between this program and OpenSSL.
 //
-//   peer client <host> <roots.pem> [--suite 1301] [--group 001d] [--alpn h2] [--now N]
+//   peer client <host> <roots.pem | roots directory | system> [--suite 1301] [--group 001d] [--alpn h2] [--now N]
 //   peer server <chain.pem> <key.pem> [--suite ...] [--group ...] [--alpn ...]
 //
 // Commands, one per line: "IN <hex>" (bytes from the network), "SEND
@@ -16,6 +16,7 @@ import bignum from "../../bigmongoose.git";
 import asn1 from "../../asn1goose.git";
 import x509 from "../../x509goose.git";
 import tls.handshake;
+import x509.pool;
 
 fn hex(b: const u8[:]) -> u8[>..] {
     var o: u8[>..] = [];
@@ -61,7 +62,12 @@ fn main() {
         chain = pem_der(a[2], "CERTIFICATE");
         key_der = pem_der(a[3], "PRIVATE KEY");
     } else {
-        cc.roots = pem_der(a[3], "CERTIFICATE");
+        // Roots from a PEM file or a directory of them, or the system's.
+        if a[3] != "system" {
+            cc.system_roots = false;
+            if is_dir(a[3]) { let n = x509::pool_add_dir(cc.roots, a[3]); }
+            else { let n = x509::pool_add_file(cc.roots, a[3]); }
+        }
     }
     var sc, okk = tls::server_config(chain, key_der);
     if is_server && !okk { write_stderr("bad key\n"); assert(false); }

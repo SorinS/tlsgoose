@@ -47,7 +47,9 @@ let ctype, plaintext, alert = tls::open_record(inn, rec);   // alert != 0: send 
 ```goose
 import tls.handshake;
 
-var cfg = tls::client_config("example.com", roots_der);   // roots: DER certificates concatenated
+var cfg = tls::client_config("example.com", "");   // the system's roots, as Go with no RootCAs
+// or: tls::client_config("example.com", roots_der)  (DER certificates concatenated)
+// or: tls::client_config_pool("example.com", pool)  (an x509::CertPool, from files or a directory)
 tls::add_alpn(cfg.alpn, "http/1.1");
 var c = tls::client(cfg);
 var out: u8[>..] = [];
@@ -72,7 +74,7 @@ EC, Ed25519, ML-DSA), SEC 1 or PKCS #1 DER.
 |---|---|---|
 | Suites | all three, in `cfg.suites` order | its own order of preference |
 | Key exchange | The post-quantum X25519MLKEM768 (the default), SecP256r1MLKEM768 and SecP384r1MLKEM1024 hybrids and MLKEM1024 alone; X25519, P-256, P-384, P-521. The defaults are Go's: everything but MLKEM1024. The client sends a share for the first of `cfg.groups` (plus, beside a hybrid, a share of its ECDH part on the same key, as Go does) and reaches the others through HelloRetryRequest | its first group the client has a share for, else a HelloRetryRequest for its first group the client supports |
-| Certificates | checked by `x509::verify_chain`: chain to `cfg.roots`, name `cfg.server_name`, time `cfg.now` (0 for now); `cfg.verify = false` skips it | sends `cfg.chain`, signs CertificateVerify with RSA-PSS, ECDSA (P-256, P-384, P-521), Ed25519 or ML-DSA as its key and the client allow |
+| Certificates | checked by `x509::verify_with_roots`: chain to `cfg.roots`, or to the system's roots when `cfg.system_roots`, name `cfg.server_name`, time `cfg.now` (0 for now); `cfg.verify = false` skips it | sends `cfg.chain`, signs CertificateVerify with RSA-PSS, ECDSA (P-256, P-384, P-521), Ed25519 or ML-DSA as its key and the client allow |
 | CertificateVerify | ML-DSA-44/65/87 (draft-ietf-tls-mldsa, offered first, as Go does), RSA-PSS, RSA PKCS #1 v1.5, ECDSA P-256/P-384/P-521, Ed25519 | |
 | ALPN | `cfg.alpn` offered | its first protocol the client offered, or `no_application_protocol` |
 | After the handshake | NewSessionTicket counted and dropped; KeyUpdate both ways (`key_update(c, request, out)`) | KeyUpdate |
@@ -144,7 +146,7 @@ python3 scripts/run_tests.py --native   # also built with the C compiler
   certificate, no common suite or group, an ALPN mismatch, and a changed
   record. Input is also fed a byte at a time.
 
-`scripts/live_interop.py` runs live connections against OpenSSL (67
+`scripts/live_interop.py` runs live connections against OpenSSL (69
 cases). It builds `tools/peer.goose`, a peer driven over stdin and stdout,
 and relays its bytes to Python's ssl module through memory BIOs. It
 covers:
@@ -161,7 +163,8 @@ covers:
 - a HelloRetryRequest in each direction (the OpenSSL client offers its
   post-quantum hybrid share first);
 - ALPN both ways, a KeyUpdate that OpenSSL answers, and close_notify;
-- an untrusted root and a wrong name.
+- roots from a directory; an untrusted root, the system's roots (which lack
+  the test root), and a wrong name.
 
 The compiler is found as in bignum: `--goose`, `$GOOSE`, `goose` on PATH,
 then `../goose.git/build/goose`.

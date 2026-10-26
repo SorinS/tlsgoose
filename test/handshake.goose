@@ -10,6 +10,7 @@ import bignum from "../../bigmongoose.git";
 import asn1 from "../../asn1goose.git";
 import x509 from "../../x509goose.git";
 import tls.handshake;
+import x509.pool;
 
 var failures = 0;
 var checks = 0;
@@ -265,11 +266,34 @@ fn main() {
 
     // Failures the client must catch.
     var wrong_root = client_cfg();
-    wrong_root.roots.clear();
-    wrong_root.roots.append(field("p256", 2));         // a leaf is no root for the others
+    wrong_root.roots = x509::new_pool();
+    let okw = x509::pool_add(wrong_root.roots, field("p256", 2));   // a leaf is no root for the others
     let srv_wrong_root = server_cfg("ed25519");
     let a1, b1 = handshake_alert(wrong_root, srv_wrong_root);
     check("unknown ca", a1 == tls::ALERT_UNKNOWN_CA);
+    // Roots: the system's when none are given (which do not include the
+    // test root), a pool from the root's file, from a directory of
+    // certificates, and an empty pool.
+    var sys_cfg = tls::client_config("example.com", "");
+    sys_cfg.now = NOW;
+    check("system roots by default", sys_cfg.system_roots);
+    let a0, b0 = handshake_alert(sys_cfg, srv_wrong_root);
+    check("system roots: unknown ca", a0 == tls::ALERT_UNKNOWN_CA);
+    var from_file = x509::new_pool();
+    check("root file", x509::pool_add_file(from_file, "vectors/hs_root.pem") == 1);
+    var file_cfg = tls::client_config_pool("example.com", from_file);
+    file_cfg.now = NOW;
+    check("pool from a file", !file_cfg.system_roots && handshake_ok("ed25519", file_cfg, srv_wrong_root));
+    var from_dir = x509::new_pool();
+    check("root directory", x509::pool_add_dir(from_dir, "vectors") > 1);
+    var dir_cfg = tls::client_config_pool("example.com", from_dir);
+    dir_cfg.now = NOW;
+    check("pool from a directory", handshake_ok("ed25519", dir_cfg, srv_wrong_root));
+    let none = x509::new_pool();
+    var none_cfg = tls::client_config_pool("example.com", none);
+    none_cfg.now = NOW;
+    let a00, b00 = handshake_alert(none_cfg, srv_wrong_root);
+    check("empty pool: unknown ca", a00 == tls::ALERT_UNKNOWN_CA);
     var wrong_name = client_cfg();
     wrong_name.server_name.clear();
     wrong_name.server_name.append("other.org");
