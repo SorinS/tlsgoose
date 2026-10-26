@@ -14,10 +14,11 @@
 // P-384 and P-521 key exchange with
 // HelloRetryRequest; server certificates checked by x509
 // (chain, host name, CertificateVerify) with RSA-PSS, RSA PKCS #1 v1.5,
-// ECDSA, Ed25519 and ML-DSA; ALPN; KeyUpdate; middlebox compatibility
-// mode; resumption with tickets (psk_dhe_ke, tls.session).
-// Not supported: 0-RTT, external PSKs, client certificates (a request is
-// answered with none), and TLS below 1.3.
+// ECDSA, Ed25519 and ML-DSA; client certificates, requested and checked as
+// Go's ClientAuth modes do; ALPN; KeyUpdate; middlebox compatibility mode;
+// resumption with tickets (psk_dhe_ke, tls.session).
+// Not supported: 0-RTT, external PSKs, post-handshake client
+// authentication, and TLS below 1.3.
 
 namespace tls;
 
@@ -66,7 +67,20 @@ let EXT_KEY_SHARE: u16 = 51;
 let EXT_PRE_SHARED_KEY: u16 = 41;
 let EXT_EARLY_DATA: u16 = 42;
 let EXT_PSK_KEY_EXCHANGE_MODES: u16 = 45;
+let EXT_CERTIFICATE_AUTHORITIES: u16 = 47;
 let PSK_DHE_KE: u8 = 1;
+
+// What a server asks of clients (ServerConfig.client_auth), as Go's
+// ClientAuthType: no certificate; one requested, not checked; one
+// required, not checked; one checked if given; one required and checked.
+// Checked, it must lead to one of the client CAs and allow client
+// authentication. A client that sends a certificate always proves it has
+// its key (CertificateVerify).
+let NO_CLIENT_CERT: i64 = 0;
+let REQUEST_CLIENT_CERT: i64 = 1;
+let REQUIRE_ANY_CLIENT_CERT: i64 = 2;
+let VERIFY_CLIENT_CERT_IF_GIVEN: i64 = 3;
+let REQUIRE_AND_VERIFY_CLIENT_CERT: i64 = 4;
 
 // Connection states.
 let ST_START: i64 = 0;
@@ -79,6 +93,8 @@ let ST_WAIT_FINISHED: i64 = 6;
 let ST_WAIT_CH: i64 = 10;
 let ST_WAIT_CH2: i64 = 11;
 let ST_WAIT_CLIENT_FINISHED: i64 = 12;
+let ST_WAIT_CLIENT_CERT: i64 = 13;
+let ST_WAIT_CLIENT_CV: i64 = 14;
 let ST_CONNECTED: i64 = 20;
 let ST_CLOSED: i64 = 21;              // the peer sent close_notify
 let ST_FAILED: i64 = 22;              // an alert was sent or received
@@ -101,12 +117,15 @@ let MAX_HANDSHAKE: i64 = 65536;
 // now), its groups (the first gets a key share), suites and ALPN
 // protocols, a DRBG seed for tests (0: the OS's entropy), a session to
 // resume (from tls::session of an earlier connection; none when its
-// ticket is empty), and the trusted roots: the system's
+// ticket is empty), a certificate chain (concatenated DER, the leaf first;
+// none when empty) and its key for servers that ask for one (set with
+// set_client_certificate), and the trusted roots: the system's
 // (x509::system_roots), or a pool of its own when system_roots is false.
 struct ClientConfig {
     server_name: u8[..255], verify: bool, now: i64,
     groups: u16[..8], suites: u16[..8], alpn: u8[..255], seed: u64,
     session: Session,
+    cert_key: x509::PrivateKey, cert_chain: u8[..65536],
     system_roots: bool,
     roots: x509::CertPool,
 }
@@ -119,7 +138,8 @@ fn client_config(server_name: const u8[:], roots: const u8[:]) -> ClientConfig {
         groups: [GROUP_X25519MLKEM768, GROUP_SECP256R1MLKEM768, GROUP_SECP384R1MLKEM1024, GROUP_X25519,
                  GROUP_SECP256R1, GROUP_SECP384R1, GROUP_SECP521R1],
         suites: [TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256],
-        alpn: [], seed: 0, session: no_session(), system_roots: roots.len == 0, roots: x509::new_pool(),
+        alpn: [], seed: 0, session: no_session(), cert_key: x509::empty_key(), cert_chain: [],
+        system_roots: roots.len == 0, roots: x509::new_pool(),
     };
     c.server_name.append(server_name);
     let ok = x509::pool_add_concatenated(c.roots, roots);
@@ -135,6 +155,21 @@ fn client_config_pool(server_name: const u8[:], roots: const x509::CertPool&) ->
     return c;
 }
 
+// The certificate the client sends when asked for one: a chain
+// (concatenated DER, the leaf first) and its private key in DER, as
+// server_config takes them. It is sent when the server accepts a scheme
+// its key signs with and, if the server names the CAs it accepts, one of
+// its certificates was issued by one of them (as Go picks one); otherwise
+// the client sends none. False if the key does not parse.
+fn set_client_certificate(cfg: ClientConfig&, chain: const u8[:], key_der: const u8[:]) -> bool {
+    let k, ok = x509::parse_private_key(key_der);
+    if !ok || chain.len > cfg.cert_chain.cap { return false; }
+    cfg.cert_key = k;
+    cfg.cert_chain.clear();
+    cfg.cert_chain.append(chain);
+    return true;
+}
+
 // Adds a protocol to an ALPN list (wire format: length-prefixed names).
 fn add_alpn(list: u8[..255]&, proto: const u8[:]) {
     assert(proto.len > 0 && proto.len < 256 && list.len + 1 + proto.len <= 255);
@@ -147,13 +182,18 @@ fn add_alpn(list: u8[..255]&, proto: const u8[:]) {
 // the time (0: now), how many session tickets to send after a handshake
 // (Go's one by default; 0 for none, which also refuses resumption) and the
 // key that seals them (random; give every server that should resume the
-// others' sessions the same one), and its certificate chain as
-// concatenated DER, the leaf first.
+// others' sessions the same one), its certificate chain as concatenated
+// DER, the leaf first, what it asks of clients (NO_CLIENT_CERT, ...), and
+// the CAs it accepts client certificates from: named to clients in the
+// request, and the roots their chains are checked against (the system's
+// when there are none, as Go does).
 struct ServerConfig {
     key: x509::PrivateKey,
     groups: u16[..8], suites: u16[..8], alpn: u8[..255], seed: u64, now: i64,
     tickets: i64, ticket_key: u8[32],
-    chain: u8[>..],
+    chain: u8[..65536],
+    client_auth: i64,
+    client_cas: x509::CertPool,
 }
 
 // A server configuration from a chain (concatenated DER) and a private key
@@ -166,8 +206,10 @@ fn server_config(chain: const u8[:], key_der: const u8[:]) -> ServerConfig, bool
                  GROUP_SECP256R1, GROUP_SECP384R1, GROUP_SECP521R1],
         suites: [TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256],
         alpn: [], seed: 0, now: 0, tickets: 1, ticket_key: [0; 32], chain: [],
+        client_auth: NO_CLIENT_CERT, client_cas: x509::new_pool(),
     };
     bignum::random_bytes(s.ticket_key);
+    if chain.len > s.chain.cap { return s, false; }
     s.chain.append(chain);
     return s, ok;
 }
@@ -184,6 +226,8 @@ struct Conn {
     group: u16, group2: u16,          // the share's group, and a second share's (X25519 beside the hybrid)
     x25519_sk: u8[32], ec_sk: u8[..66], mlkem_seed: u8[64],
     hrr: bool, ccs_sent: bool, cert_requested: bool, cr_context: u8[..255],
+    cert_scheme: u16,                 // the client's: the scheme of its CertificateVerify (0: no certificate)
+    peer_verified: bool,              // the peer's certificate was checked against the roots
     peer_schemes: u16[..32], alpn: u8[..255], sni: u8[..255],
     tickets: i64, key_updates: i64,
     psk_offered: bool, resumed: bool,  // the client offered its session; the PSK was accepted
@@ -207,7 +251,7 @@ fn new_conn(is_server: bool, seed: u64) -> Conn {
         read: record_keys(s, zero), write: record_keys(s, zero), read_protected: false, write_protected: false,
         drbg_k: [0; 32], drbg_v: [1; 32], random: [0; 32], session_id: [],
         group: 0, group2: 0, x25519_sk: [0; 32], ec_sk: [], mlkem_seed: [0; 64], hrr: false, ccs_sent: false, cert_requested: false,
-        cr_context: [], peer_schemes: [], alpn: [], sni: [], tickets: 0, key_updates: 0,
+        cr_context: [], cert_scheme: 0, peer_verified: false, peer_schemes: [], alpn: [], sni: [], tickets: 0, key_updates: 0,
         psk_offered: false, resumed: false, psk_dhe: false, peer_not_after: 0, has_session: false, session: no_session(),
         ch: [], inbuf: [], hs: [], chain: [],
     };
@@ -263,6 +307,18 @@ fn resumed(c: const Conn&) -> bool { c.resumed }
 // The client's latest session ticket, to resume with later (set it as
 // ClientConfig.session); false before the server has sent one.
 fn session(c: const Conn&) -> Session, bool { return c.session, c.has_session; }
+// The peer's certificates, DER concatenated, the leaf first: the server's,
+// or the client's (also carried over by resumption); empty for none.
+fn peer_certificates(c: const Conn&) -> u8[>..] {
+    var out: u8[>..] = [];
+    out.append(c.chain);
+    return out;
+}
+
+// Whether the peer's certificate was checked against the trusted roots
+// (for a client's, by a server that verifies them).
+fn peer_verified(c: const Conn&) -> bool { c.peer_verified }
+
 fn failed(c: const Conn&) -> bool { c.state == ST_FAILED }
 fn closed(c: const Conn&) -> bool { c.state == ST_CLOSED }
 
@@ -550,18 +606,18 @@ fn offered_scheme(list: const u16[:], s: u16) -> bool {
     return false;
 }
 
-// The scheme the server signs with, for its key and the client's list; 0
-// for none.
-fn pick_scheme(cfg: const ServerConfig&, peer: const u16[:]) -> u16 {
-    if cfg.key.kind == x509::KEY_ED25519 && offered_scheme(peer, x509::ED25519) { return x509::ED25519; }
-    if x509::is_mldsa(cfg.key.kind) {
-        let s = x509::mldsa_scheme(x509::mldsa_set(cfg.key.kind));
+// The scheme to sign CertificateVerify with, for a key and the peer's list;
+// 0 for none.
+fn pick_scheme(key: const x509::PrivateKey&, peer: const u16[:]) -> u16 {
+    if key.kind == x509::KEY_ED25519 && offered_scheme(peer, x509::ED25519) { return x509::ED25519; }
+    if x509::is_mldsa(key.kind) {
+        let s = x509::mldsa_scheme(x509::mldsa_set(key.kind));
         if offered_scheme(peer, s) { return s; }
     }
-    if cfg.key.kind == x509::KEY_EC_P256 && offered_scheme(peer, x509::ECDSA_SECP256R1_SHA256) { return x509::ECDSA_SECP256R1_SHA256; }
-    if cfg.key.kind == x509::KEY_EC_P384 && offered_scheme(peer, x509::ECDSA_SECP384R1_SHA384) { return x509::ECDSA_SECP384R1_SHA384; }
-    if cfg.key.kind == x509::KEY_EC_P521 && offered_scheme(peer, x509::ECDSA_SECP521R1_SHA512) { return x509::ECDSA_SECP521R1_SHA512; }
-    if cfg.key.kind == x509::KEY_RSA {
+    if key.kind == x509::KEY_EC_P256 && offered_scheme(peer, x509::ECDSA_SECP256R1_SHA256) { return x509::ECDSA_SECP256R1_SHA256; }
+    if key.kind == x509::KEY_EC_P384 && offered_scheme(peer, x509::ECDSA_SECP384R1_SHA384) { return x509::ECDSA_SECP384R1_SHA384; }
+    if key.kind == x509::KEY_EC_P521 && offered_scheme(peer, x509::ECDSA_SECP521R1_SHA512) { return x509::ECDSA_SECP521R1_SHA512; }
+    if key.kind == x509::KEY_RSA {
         for s in [x509::RSA_PSS_RSAE_SHA256, x509::RSA_PSS_RSAE_SHA384, x509::RSA_PSS_RSAE_SHA512] {
             if offered_scheme(peer, s) { return s; }
         }
@@ -569,16 +625,16 @@ fn pick_scheme(cfg: const ServerConfig&, peer: const u16[:]) -> u16 {
     return 0;
 }
 
-fn sign(cfg: const ServerConfig&, scheme: u16, msg: const u8[:]) -> u8[>..] {
-    if scheme == x509::ED25519 { return x509::sign(cfg.key, x509::SIG_ED25519, 0, msg); }
+fn sign(key: const x509::PrivateKey&, scheme: u16, msg: const u8[:]) -> u8[>..] {
+    if scheme == x509::ED25519 { return x509::sign(key, x509::SIG_ED25519, 0, msg); }
     if scheme == x509::MLDSA44 || scheme == x509::MLDSA65 || scheme == x509::MLDSA87 {
-        return x509::sign(cfg.key, x509::SIG_MLDSA, x509::mldsa_set(cfg.key.kind), msg);
+        return x509::sign(key, x509::SIG_MLDSA, x509::mldsa_set(key.kind), msg);
     }
-    if scheme == x509::ECDSA_SECP256R1_SHA256 { return x509::sign(cfg.key, x509::SIG_ECDSA, 256, msg); }
-    if scheme == x509::ECDSA_SECP384R1_SHA384 { return x509::sign(cfg.key, x509::SIG_ECDSA, 384, msg); }
-    if scheme == x509::ECDSA_SECP521R1_SHA512 { return x509::sign(cfg.key, x509::SIG_ECDSA, 512, msg); }
+    if scheme == x509::ECDSA_SECP256R1_SHA256 { return x509::sign(key, x509::SIG_ECDSA, 256, msg); }
+    if scheme == x509::ECDSA_SECP384R1_SHA384 { return x509::sign(key, x509::SIG_ECDSA, 384, msg); }
+    if scheme == x509::ECDSA_SECP521R1_SHA512 { return x509::sign(key, x509::SIG_ECDSA, 512, msg); }
     let h = if scheme == x509::RSA_PSS_RSAE_SHA256 { 256 } else if scheme == x509::RSA_PSS_RSAE_SHA384 { 384 } else { 512 };
-    return x509::sign(cfg.key, x509::SIG_RSA_PSS, h, msg);
+    return x509::sign(key, x509::SIG_RSA_PSS, h, msg);
 }
 
 // The alert for a certificate the client refuses.
@@ -852,11 +908,13 @@ fn client_encrypted_extensions(c: Conn&, cfg: const ClientConfig&, m: const u8[:
     return 0;
 }
 
-fn client_certificate(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8[>..]&) -> i64 {
+// The certificates of a Certificate message, whose context must be
+// `context`, into c.chain; how many, or -1 after failing.
+fn read_certificates(c: Conn&, m: const u8[:], context: const u8[:], out: u8[>..]&) -> i64 {
     var b = Rd { pos: 4, end: m.len, bad: false };
     let ctx = get_vec(b, m, 1);
     var list = get_vec(b, m, 3);
-    if !done(b) || ctx.end != ctx.pos { return fail(c, ALERT_DECODE_ERROR, out); }
+    if !done(b) || m[ctx.pos..ctx.end] != context { return fail(c, ALERT_DECODE_ERROR, out); }
     c.chain.clear();
     var count = 0;
     while list.pos < list.end {
@@ -867,6 +925,12 @@ fn client_certificate(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u
         c.chain.append(m[cert.pos..cert.end]);
         count++;
     }
+    return count;
+}
+
+fn client_certificate(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8[>..]&) -> i64 {
+    let count = read_certificates(c, m, "", out);
+    if count < 0 { return count; }
     if count == 0 { return fail(c, ALERT_DECODE_ERROR, out); }
     let ct, okt = asn1::read(c.chain, 0, c.chain.len);
     if !okt { return fail(c, ALERT_BAD_CERTIFICATE, out); }
@@ -885,13 +949,16 @@ fn client_certificate(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u
         }
         let leaf, el = x509::parse(c.chain[..ct.end]);
         c.peer_not_after = leaf.not_after;
+        c.peer_verified = true;
     }
     transcript_add(c.th, m);
     c.state = ST_WAIT_CV;
     return 0;
 }
 
-fn client_certificate_verify(c: Conn&, m: const u8[:], out: u8[>..]&) -> i64 {
+// The peer's CertificateVerify, by the leaf of c.chain over the transcript
+// so far (§4.4.3); 0, or -1 after failing.
+fn peer_certificate_verify(c: Conn&, m: const u8[:], out: u8[>..]&) -> i64 {
     var b = Rd { pos: 4, end: m.len, bad: false };
     let scheme = get_u16(b, m);
     let sig = get_vec(b, m, 2);
@@ -900,33 +967,137 @@ fn client_certificate_verify(c: Conn&, m: const u8[:], out: u8[>..]&) -> i64 {
     let ct, okt = asn1::read(c.chain, 0, c.chain.len);
     let leaf, e = x509::parse(c.chain[..ct.end]);
     if e != x509::OK { return fail(c, ALERT_BAD_CERTIFICATE, out); }
-    let content = cv_content(true, transcript_hash(c.th));
+    let content = cv_content(!c.is_server, transcript_hash(c.th));
     if x509::verify_scheme(leaf, scheme as! u16, content, m[sig.pos..sig.end]) != x509::OK {
         return fail(c, ALERT_DECRYPT_ERROR, out);
     }
     transcript_add(c.th, m);
-    c.state = ST_WAIT_FINISHED;
     return 0;
 }
 
-fn client_finished(c: Conn&, m: const u8[:], out: u8[>..]&) -> i64 {
+// A CertificateRequest (§4.3.2): the signature schemes the server takes
+// and, if it names them, the CAs it accepts. The client's certificate is
+// picked now, sent with its Finished: when its key signs with one of those
+// schemes and, if CAs are named, one of the chain's certificates was
+// issued by one of them (Go's CertificateRequestInfo.SupportsCertificate).
+fn client_certificate_request(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8[>..]&) -> i64 {
+    var b = Rd { pos: 4, end: m.len, bad: false };
+    let ctx = get_vec(b, m, 1);
+    var exts = get_vec(b, m, 2);
+    if !done(b) { return fail(c, ALERT_DECODE_ERROR, out); }
+    var schemes: u16[..64] = [];
+    var has_schemes = false;
+    var cas = empty_rd();
+    var has_cas = false;
+    while exts.pos < exts.end {
+        let ty = get_u16(exts, m);
+        var e = get_vec(exts, m, 2);
+        if exts.bad { return fail(c, ALERT_DECODE_ERROR, out); }
+        if ty == EXT_SIGNATURE_ALGORITHMS {
+            var l = get_vec(e, m, 2);
+            while l.pos + 1 < l.end {
+                let v = get_u16(l, m);
+                if schemes.len < schemes.cap { schemes.push(v as! u16); }
+            }
+            has_schemes = true;
+        } else if ty == EXT_CERTIFICATE_AUTHORITIES {
+            cas = get_vec(e, m, 2);
+            has_cas = true;
+        }
+        if e.bad { return fail(c, ALERT_DECODE_ERROR, out); }
+    }
+    if !has_schemes { return fail(c, ALERT_MISSING_EXTENSION, out); }
+    c.cr_context.clear();
+    c.cr_context.append(m[ctx.pos..ctx.end]);
+    c.cert_requested = true;
+    c.cert_scheme = 0;
+    if cfg.cert_chain.len > 0 {
+        let sch = pick_scheme(cfg.cert_key, schemes);
+        if sch != 0 && (!has_cas || issued_by_one_of(cfg.cert_chain, m, cas)) { c.cert_scheme = sch; }
+    }
+    transcript_add(c.th, m);
+    c.state = ST_WAIT_CERT;
+    return 0;
+}
+
+// Whether a certificate of a chain was issued by one of a list of
+// DistinguishedNames (offsets into m).
+fn issued_by_one_of(chain: const u8[:], m: const u8[:], cas: Rd) -> bool {
+    var off = 0;
+    while off < chain.len {
+        let t, ok = asn1::read(chain, off, chain.len);
+        if !ok { return false; }
+        let cert, e = x509::parse(chain[t.start..t.end]);
+        if e == x509::OK {
+            let issuer = cert.der[cert.issuer.start..cert.issuer.end];
+            var l = cas;
+            while l.pos < l.end {
+                let dn = get_vec(l, m, 2);
+                if l.bad { break; }
+                if m[dn.pos..dn.end] == issuer { return true; }
+            }
+        }
+        off = t.end;
+    }
+    return false;
+}
+
+// A Certificate message (§4.4.2) of a chain (concatenated DER; none when
+// empty); false if the chain is malformed.
+fn certificate_message(context: const u8[:], chain: const u8[:]) -> u8[>..], bool {
+    var body: u8[>..] = [];
+    body.push(context.len as! u8);
+    body.append(context);
+    let list = begin_vec(body, 3);
+    var off = 0;
+    while off < chain.len {
+        let t, ok = asn1::read(chain, off, chain.len);
+        if !ok {
+            var none: u8[>..] = [];
+            return none, false;
+        }
+        let one = begin_vec(body, 3);
+        body.append(chain[t.start..t.end]);
+        patch_len(body, one, 3);
+        put_u16(body, 0);
+        off = t.end;
+    }
+    patch_len(body, list, 3);
+    return handshake_message(HS_CERTIFICATE, body), true;
+}
+
+// A CertificateVerify by `key` over the transcript hash `th`.
+fn certificate_verify_message(key: const x509::PrivateKey&, scheme: u16, server_side: bool,
+                              th: const u8[:]) -> u8[>..] {
+    let sig = sign(key, scheme, cv_content(server_side, th));
+    var cv: u8[>..] = [];
+    put_u16(cv, scheme);
+    put_u16(cv, sig.len as! u16);
+    cv.append(sig);
+    return handshake_message(HS_CERTIFICATE_VERIFY, cv);
+}
+
+fn client_finished(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8[>..]&) -> i64 {
     if !finished_ok(c.suite.hash, c.sch.s_hs, transcript_hash(c.th), m[4..]) {
         return fail(c, ALERT_DECRYPT_ERROR, out);
     }
     if c.hs.len != 0 { return fail(c, ALERT_UNEXPECTED_MESSAGE, out); }   // the key change ends a record
     transcript_add(c.th, m);
     schedule_master(c.sch, transcript_hash(c.th));
-    // The client's flight: change_cipher_spec, an empty Certificate if one
-    // was asked for, Finished.
+    // The client's flight: change_cipher_spec; if a certificate was asked
+    // for, Certificate (empty without a suitable one) and CertificateVerify;
+    // Finished.
     send_ccs(c, out);
     c.write = record_keys(c.suite, c.sch.c_hs);
     c.write_protected = true;
-    if c.cert_requested {
-        var body: u8[>..] = [];
-        body.push(c.cr_context.len as! u8);
-        body.append(c.cr_context);
-        body.push(0); body.push(0); body.push(0);
-        send_hs(c, handshake_message(HS_CERTIFICATE, body), out);
+    if c.cert_requested && c.cert_scheme == 0 {
+        let cm, okm = certificate_message(c.cr_context, "");
+        send_hs(c, cm, out);
+    } else if c.cert_requested {
+        let cm, okm = certificate_message(c.cr_context, cfg.cert_chain);
+        if !okm { return fail(c, ALERT_INTERNAL_ERROR, out); }
+        send_hs(c, cm, out);
+        send_hs(c, certificate_verify_message(cfg.cert_key, c.cert_scheme, false, transcript_hash(c.th)), out);
     }
     let fin = finished_data(c.suite.hash, c.sch.c_hs, transcript_hash(c.th));
     send_hs(c, handshake_message(HS_FINISHED, fin), out);
@@ -941,23 +1112,16 @@ fn client_message(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8[>.
     let t = m[0];
     if c.state == ST_WAIT_SH && t == HS_SERVER_HELLO { return client_server_hello(c, cfg, m, out); }
     if c.state == ST_WAIT_EE && t == HS_ENCRYPTED_EXTENSIONS { return client_encrypted_extensions(c, cfg, m, out); }
-    if c.state == ST_WAIT_CERT_CR && t == HS_CERTIFICATE_REQUEST {
-        var b = Rd { pos: 4, end: m.len, bad: false };
-        let ctx = get_vec(b, m, 1);
-        let exts = get_vec(b, m, 2);
-        if !done(b) { return fail(c, ALERT_DECODE_ERROR, out); }
-        c.cr_context.clear();
-        c.cr_context.append(m[ctx.pos..ctx.end]);
-        c.cert_requested = true;
-        transcript_add(c.th, m);
-        c.state = ST_WAIT_CERT;
-        return 0;
-    }
+    if c.state == ST_WAIT_CERT_CR && t == HS_CERTIFICATE_REQUEST { return client_certificate_request(c, cfg, m, out); }
     if (c.state == ST_WAIT_CERT_CR || c.state == ST_WAIT_CERT) && t == HS_CERTIFICATE {
         return client_certificate(c, cfg, m, out);
     }
-    if c.state == ST_WAIT_CV && t == HS_CERTIFICATE_VERIFY { return client_certificate_verify(c, m, out); }
-    if c.state == ST_WAIT_FINISHED && t == HS_FINISHED { return client_finished(c, m, out); }
+    if c.state == ST_WAIT_CV && t == HS_CERTIFICATE_VERIFY {
+        let r = peer_certificate_verify(c, m, out);
+        if r == 0 { c.state = ST_WAIT_FINISHED; }
+        return r;
+    }
+    if c.state == ST_WAIT_FINISHED && t == HS_FINISHED { return client_finished(c, cfg, m, out); }
     if c.state == ST_CONNECTED && t == HS_NEW_SESSION_TICKET { return client_ticket(c, cfg, m, out); }
     if c.state == ST_CONNECTED { return post_handshake(c, m, out); }
     return fail(c, ALERT_UNEXPECTED_MESSAGE, out);
@@ -1167,7 +1331,7 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
     c.peer_schemes.clear();
     var sl = h.schemes;
     while sl.pos + 1 < sl.end && c.peer_schemes.len < c.peer_schemes.cap { c.peer_schemes.push(get_u16(sl, m) as! u16); }
-    let scheme = pick_scheme(cfg, c.peer_schemes);
+    let scheme = pick_scheme(cfg.key, c.peer_schemes);
     // ALPN: the server's first protocol the client offered.
     c.alpn.clear();
     if h.alpn.end > h.alpn.pos && cfg.alpn.len > 0 {
@@ -1206,9 +1370,15 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
             if ids.bad { return fail(c, ALERT_DECODE_ERROR, out); }
             let t, okt = open_ticket(cfg.ticket_key, m[id.pos..id.end]);
             let ts, okts = suite(t.suite);
-            if okt && okts && ts.hash == s.hash && now >= t.created && now - t.created <= t.lifetime {
+            if okt && okts && ts.hash == s.hash && now >= t.created && now - t.created <= t.lifetime &&
+               ticket_client_ok(cfg, t, now) {
                 psk_identity = idx;
                 psk.append(t.psk);
+                // The client's certificate, carried over.
+                c.chain.clear();
+                c.chain.append(t.client_chain);
+                c.peer_verified = t.client_verified;
+                c.peer_not_after = t.client_not_after;
             }
             idx++;
         }
@@ -1253,7 +1423,10 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
     }
     patch_len(ee, exts, 2);
     send_hs(c, handshake_message(HS_ENCRYPTED_EXTENSIONS, ee), out);
+    // Resumed, the PSK authenticates both sides; the client's certificate,
+    // if any, comes from the ticket.
     if !c.resumed {
+        if cfg.client_auth != NO_CLIENT_CERT { send_certificate_request(c, cfg, out); }
         let e = send_certificate(c, cfg, scheme, out);
         if e != 0 { return e; }
     }
@@ -1261,33 +1434,97 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
     send_hs(c, handshake_message(HS_FINISHED, fin), out);
     schedule_master(c.sch, transcript_hash(c.th));
     c.write = record_keys(s, c.sch.s_ap);
-    c.state = ST_WAIT_CLIENT_FINISHED;
+    c.state = if c.cert_requested { ST_WAIT_CLIENT_CERT } else { ST_WAIT_CLIENT_FINISHED };
     return 0;
+}
+
+// Whether a ticket's client certificate suits what the server asks of
+// clients now, as Go checks: one if required, none if none is asked for,
+// unexpired, and checked if the server checks them.
+fn ticket_client_ok(cfg: const ServerConfig&, t: const TicketState&, now: i64) -> bool {
+    if t.client_chain.len == 0 {
+        return cfg.client_auth != REQUIRE_ANY_CLIENT_CERT && cfg.client_auth != REQUIRE_AND_VERIFY_CLIENT_CERT;
+    }
+    if cfg.client_auth == NO_CLIENT_CERT || now > t.client_not_after { return false; }
+    return cfg.client_auth < VERIFY_CLIENT_CERT_IF_GIVEN || t.client_verified;
+}
+
+// CertificateRequest (§4.3.2): an empty context, the schemes accepted and,
+// when the server has client CAs, their names (as Go sends them).
+fn send_certificate_request(c: Conn&, cfg: const ServerConfig&, out: u8[>..]&) {
+    var b: u8[>..] = [];
+    b.push(0);
+    let exts = begin_vec(b, 2);
+    let sa = begin_ext(b, EXT_SIGNATURE_ALGORITHMS);
+    let sl = begin_vec(b, 2);
+    for sc in SIG_SCHEMES { put_u16(b, sc); }
+    patch_len(b, sl, 2);
+    patch_len(b, sa, 2);
+    var names: u8[>..] = [];
+    for i in x509::pool_len(cfg.client_cas) {
+        let ca = x509::pool_cert(cfg.client_cas, i);
+        let dn = ca.der[ca.subject.start..ca.subject.end];
+        put_u16(names, dn.len as! u16);
+        names.append(dn);
+    }
+    if names.len > 0 && names.len <= MAX_HANDSHAKE - 1024 {
+        let ca = begin_ext(b, EXT_CERTIFICATE_AUTHORITIES);
+        put_u16(b, names.len as! u16);
+        b.append(names);
+        patch_len(b, ca, 2);
+    }
+    patch_len(b, exts, 2);
+    send_hs(c, handshake_message(HS_CERTIFICATE_REQUEST, b), out);
+    c.cert_requested = true;
 }
 
 // Certificate and CertificateVerify.
 fn send_certificate(c: Conn&, cfg: const ServerConfig&, scheme: u16, out: u8[>..]&) -> i64 {
-    var cert: u8[>..] = [];
-    cert.push(0);
-    let list = begin_vec(cert, 3);
-    var off = 0;
-    while off < cfg.chain.len {
-        let t, okc = asn1::read(cfg.chain, off, cfg.chain.len);
-        if !okc { return fail(c, ALERT_INTERNAL_ERROR, out); }
-        let one = begin_vec(cert, 3);
-        cert.append(cfg.chain[t.start..t.end]);
-        patch_len(cert, one, 3);
-        put_u16(cert, 0);
-        off = t.end;
+    let cm, ok = certificate_message("", cfg.chain);
+    if !ok { return fail(c, ALERT_INTERNAL_ERROR, out); }
+    send_hs(c, cm, out);
+    send_hs(c, certificate_verify_message(cfg.key, scheme, true, transcript_hash(c.th)), out);
+    return 0;
+}
+
+// The client's Certificate: none (if allowed), or a chain that is checked
+// when the server checks them; CertificateVerify follows.
+fn server_client_certificate(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: u8[>..]&) -> i64 {
+    let count = read_certificates(c, m, c.cr_context, out);
+    if count < 0 { return count; }
+    if count == 0 {
+        if cfg.client_auth == REQUIRE_ANY_CLIENT_CERT || cfg.client_auth == REQUIRE_AND_VERIFY_CLIENT_CERT {
+            return fail(c, ALERT_CERTIFICATE_REQUIRED, out);
+        }
+        transcript_add(c.th, m);
+        c.state = ST_WAIT_CLIENT_FINISHED;
+        return 0;
     }
-    patch_len(cert, list, 3);
-    send_hs(c, handshake_message(HS_CERTIFICATE, cert), out);
-    let sig = sign(cfg, scheme, cv_content(true, transcript_hash(c.th)));
-    var cv: u8[>..] = [];
-    put_u16(cv, scheme);
-    put_u16(cv, sig.len as! u16);
-    cv.append(sig);
-    send_hs(c, handshake_message(HS_CERTIFICATE_VERIFY, cv), out);
+    let ct, okt = asn1::read(c.chain, 0, c.chain.len);
+    if !okt { return fail(c, ALERT_BAD_CERTIFICATE, out); }
+    let leaf, el = x509::parse(c.chain[..ct.end]);
+    if el != x509::OK {
+        c.error = el;
+        return fail(c, ALERT_BAD_CERTIFICATE, out);
+    }
+    if cfg.client_auth >= VERIFY_CLIENT_CERT_IF_GIVEN {
+        let now = now_ms(cfg.now) / 1000;
+        var e = x509::OK;
+        if x509::pool_len(cfg.client_cas) == 0 {
+            let es, found = x509::verify_client_with_system_roots(c.chain[..ct.end], c.chain[ct.end..], now);
+            e = es;
+        } else {
+            e = x509::verify_client_with_roots(c.chain[..ct.end], c.chain[ct.end..], cfg.client_cas, now);
+        }
+        if e != x509::OK {
+            c.error = e;
+            return fail(c, cert_alert(e), out);
+        }
+        c.peer_verified = true;
+    }
+    c.peer_not_after = leaf.not_after;
+    transcript_add(c.th, m);
+    c.state = ST_WAIT_CLIENT_CV;
     return 0;
 }
 
@@ -1304,10 +1541,17 @@ fn send_session_ticket(c: Conn&, cfg: const ServerConfig&, out: u8[>..]&) -> boo
     drbg_fill(c, tn);
     var t = TicketState { suite: c.suite.id, psk: [], created: now_ms(cfg.now) / 1000,
                           age_add: (age_add[0] as u32) << 24 | (age_add[1] as u32) << 16 | (age_add[2] as u32) << 8 | age_add[3],
-                          lifetime: MAX_TICKET_LIFETIME, alpn: [], sni: [] };
+                          lifetime: MAX_TICKET_LIFETIME, alpn: [], sni: [], client_not_after: 0,
+                          client_verified: false, client_chain: [] };
     t.psk.append(resumption_psk(c.suite.hash, c.sch.resumption, nonce));
     t.alpn.append(c.alpn);
     t.sni.append(c.sni);
+    // The client's certificate goes in the ticket; one too big for it gets
+    // no ticket.
+    if c.chain.len > t.client_chain.cap { return false; }
+    t.client_chain.append(c.chain);
+    t.client_verified = c.peer_verified;
+    t.client_not_after = c.peer_not_after;
     let ticket = seal_ticket(cfg.ticket_key, tn, t);
     var b: u8[>..] = [];
     for i in 4 { b.push((MAX_TICKET_LIFETIME >> (8 * (3 - i))) as! u8); }
@@ -1327,6 +1571,12 @@ fn server_message(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: u8[>.
     if (c.state == ST_WAIT_CH || c.state == ST_WAIT_CH2) && t == HS_CLIENT_HELLO {
         let r = server_client_hello(c, cfg, m, out);
         if r == 0 && c.hs.len != 0 { return fail(c, ALERT_UNEXPECTED_MESSAGE, out); }
+        return r;
+    }
+    if c.state == ST_WAIT_CLIENT_CERT && t == HS_CERTIFICATE { return server_client_certificate(c, cfg, m, out); }
+    if c.state == ST_WAIT_CLIENT_CV && t == HS_CERTIFICATE_VERIFY {
+        let r = peer_certificate_verify(c, m, out);
+        if r == 0 { c.state = ST_WAIT_CLIENT_FINISHED; }
         return r;
     }
     if c.state == ST_WAIT_CLIENT_FINISHED && t == HS_FINISHED {
@@ -1462,12 +1712,13 @@ fn feed(c: Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&, input: c
 
 fn no_server() -> ServerConfig {
     ServerConfig { key: x509::empty_key(), groups: [], suites: [], alpn: [], seed: 0, now: 0, tickets: 0,
-                   ticket_key: [0; 32], chain: [] }
+                   ticket_key: [0; 32], chain: [], client_auth: NO_CLIENT_CERT, client_cas: x509::new_pool() }
 }
 
 fn no_client() -> ClientConfig {
     ClientConfig { server_name: [], verify: false, now: 0, groups: [], suites: [], alpn: [], seed: 0,
-                   session: no_session(), system_roots: false, roots: x509::new_pool() }
+                   session: no_session(), cert_key: x509::empty_key(), cert_chain: [], system_roots: false,
+                   roots: x509::new_pool() }
 }
 
 fn client_feed(c: Conn&, cfg: const ClientConfig&, input: const u8[:], out: u8[>..]&, app: u8[>..]&) -> i64 {

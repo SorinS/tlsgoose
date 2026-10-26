@@ -10,8 +10,9 @@ Cases: the Goose client against an OpenSSL server for each certificate
 type (ML-DSA ones included), cipher suite and group, with a HelloRetryRequest, ALPN, and a
 KeyUpdate; the Goose server against an OpenSSL client likewise (which
 offers its post-quantum hybrid first and so takes X25519 or a retry);
-resumption both ways (also after a HelloRetryRequest); roots from a
-directory; and failures: an untrusted root, the system's
+resumption both ways (also after a HelloRetryRequest); client
+certificates both ways (sent, missing, refused); roots from a directory;
+and failures: an untrusted root, the system's
 roots (which lack the test root), and a wrong host name.
 
     python3 scripts/live_interop.py [--goose PATH]
@@ -54,8 +55,8 @@ class Peer:
             elif kind == "SESSION":
                 self.session = None if rest == "-" else rest
             elif kind == "STATE":
-                st, alert, alpn, group, resumed = rest.split()
-                self.state = (int(st), int(alert), alpn, int(group), resumed == "1")
+                st, alert, alpn, group, resumed, peer, verified = rest.split()
+                self.state = (int(st), int(alert), alpn, int(group), resumed == "1", int(peer), verified == "1")
 
     def cmd(self, line):
         self.p.stdin.write(line + "\n")
@@ -168,6 +169,13 @@ def run_case(case):
     ctx.minimum_version = ctx.maximum_version = ssl.TLSVersion.TLSv1_3
     if case.get("alpn"):
         ctx.set_alpn_protocols(case["alpn"])
+    # Client certificates: OpenSSL's server asks for one (required or
+    # optional), or OpenSSL's client has one.
+    if case.get("py_verify"):
+        ctx.verify_mode = ssl.CERT_REQUIRED if case["py_verify"] == "required" else ssl.CERT_OPTIONAL
+        ctx.load_verify_locations(os.path.join(VEC, "hs_clientca.pem"))
+    if case.get("py_cert"):
+        ctx.load_cert_chain(os.path.join(VEC, f"hs_{case['py_cert']}.pem"), os.path.join(VEC, f"hs_{case['py_cert']}.key"))
     inc, outg = ssl.MemoryBIO(), ssl.MemoryBIO()
     obj = ctx.wrap_bio(inc, outg, server_side=goose_is_client,
                        server_hostname=None if goose_is_client else case.get("host", "example.com"))
@@ -181,6 +189,11 @@ def run_case(case):
         args += ["--group", g]
     for a in case.get("goose_alpn", []):
         args += ["--alpn", a]
+    if case.get("goose_cert"):
+        args += ["--cert", os.path.join(VEC, f"hs_{case['goose_cert']}.pem"),
+                 "--key", os.path.join(VEC, f"hs_{case['goose_cert']}.key")]
+    if case.get("goose_client_auth") is not None:
+        args += ["--client-auth", str(case["goose_client_auth"]), "--client-cas", os.path.join(VEC, "hs_clientca.pem")]
     peer = Peer(exe, args)
     to_goose = b""
     result = {"ok": False}
@@ -212,6 +225,10 @@ def run_case(case):
         return result
     result["suite"] = obj.cipher()[0]
     result["alpn"] = obj.selected_alpn_protocol()
+    if goose_is_client:
+        # The certificate OpenSSL's server got from this client, if any.
+        der = obj.getpeercert(binary_form=True)
+        result["openssl_peer"] = der.hex() if der else None
     # Goose -> OpenSSL, after a KeyUpdate that asks OpenSSL to update too.
     out, _ = peer.cmd("KEYUPDATE")
     inc.write(out)
@@ -308,6 +325,34 @@ def main():
         dict(name="goose server, OpenSSL client checks the name", role="server", cert="p256",
              host="other.org", want=False),
     ]
+    # Client certificates: this client's, to an OpenSSL server that
+    # requires one (each key type) or would take one; none where one is
+    # required; and OpenSSL's client's, to this server in each mode.
+    for kind in ("client_p256", "client_ed25519", "client_mldsa44"):
+        cases.append(dict(name=f"goose client sends a certificate ({kind[7:]})", role="client", cert="p256",
+                          goose_cert=kind, py_verify="required", want=True, want_openssl_peer=kind))
+    cases += [
+        dict(name="goose client, optional certificate, none", role="client", cert="rsa", py_verify="optional",
+             want=True, want_openssl_peer=None),
+        dict(name="goose client without a certificate, one required", role="client", cert="p256",
+             py_verify="required", want=False, goose_alert=116),
+        dict(name="goose client, certificate OpenSSL refuses (server use only)", role="client", cert="p256",
+             goose_cert="client_serveronly", py_verify="required", want=False),
+        dict(name="goose server requires and checks: OpenSSL client's P-256", role="server", cert="ed25519",
+             py_cert="client_p256", goose_client_auth=4, want=True, want_peer=True, want_verified=True),
+        dict(name="goose server requires and checks: OpenSSL client's ML-DSA-44", role="server", cert="mldsa65",
+             py_cert="client_mldsa44", goose_client_auth=4, want=True, want_peer=True, want_verified=True),
+        dict(name="goose server requires a certificate, OpenSSL client has none", role="server", cert="p256",
+             goose_client_auth=4, want=False, goose_alert=116),
+        dict(name="goose server checks if given, OpenSSL client has none", role="server", cert="p256",
+             goose_client_auth=3, want=True, want_peer=False, want_verified=False),
+        dict(name="goose server refuses a server-only certificate", role="server", cert="p256",
+             py_cert="client_serveronly", goose_client_auth=3, want=False, goose_alert=42),
+        dict(name="goose server refuses a certificate of another CA", role="server", cert="p256",
+             py_cert="p384", goose_client_auth=4, want=False, goose_alert=48),
+        dict(name="goose server requests: another CA's certificate, unchecked", role="server", cert="rsa",
+             py_cert="p384", goose_client_auth=1, want=True, want_peer=True, want_verified=False),
+    ]
     passed = 0
     for case in cases:
         case["exe"] = exe
@@ -336,6 +381,14 @@ def main():
             good = r.get("goose_state", [0, 0, 0, 0])[3] == case["want_group"]
         if good and case.get("goose_alert"):
             good = r.get("goose_state", [0, 0])[1] == case["goose_alert"]
+        if good and "want_peer" in case:
+            good = (r["goose_state"][5] > 0) == case["want_peer"] and r["goose_state"][6] == case["want_verified"]
+        if good and "want_openssl_peer" in case:
+            want = case["want_openssl_peer"]
+            if want:
+                want = subprocess.run(["openssl", "x509", "-in", os.path.join(VEC, f"hs_{want}.pem"), "-outform", "DER"],
+                                      capture_output=True, check=True).stdout.hex()
+            good = r.get("openssl_peer") == want
         print(("ok    " if good else "FAIL  ") + case["name"] + ("" if good else f"  {r}"))
         passed += good
     shutil.rmtree(tmp)

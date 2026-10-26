@@ -78,6 +78,7 @@ EC, Ed25519, ML-DSA), SEC 1 or PKCS #1 DER.
 | Key exchange | The post-quantum X25519MLKEM768 (the default), SecP256r1MLKEM768 and SecP384r1MLKEM1024 hybrids and MLKEM1024 alone; X25519, P-256, P-384, P-521. The defaults are Go's: everything but MLKEM1024. The client sends a share for the first of `cfg.groups` (plus, beside a hybrid, a share of its ECDH part on the same key, as Go does) and reaches the others through HelloRetryRequest | its first group the client has a share for, else a HelloRetryRequest for its first group the client supports |
 | Certificates | checked by `x509::verify_with_roots`: chain to `cfg.roots`, or to the system's roots when `cfg.system_roots`, name `cfg.server_name`, time `cfg.now` (0 for now); `cfg.verify = false` skips it | sends `cfg.chain`, signs CertificateVerify with RSA-PSS, ECDSA (P-256, P-384, P-521), Ed25519 or ML-DSA as its key and the client allow |
 | CertificateVerify | ML-DSA-44/65/87 (draft-ietf-tls-mldsa, offered first, as Go does), RSA-PSS, RSA PKCS #1 v1.5, ECDSA P-256/P-384/P-521, Ed25519 | |
+| Client certificates | sends `cfg.cert_chain` (set with `tls::set_client_certificate(cfg, chain_der, key_der)`) when asked, if its key signs with a scheme the server takes and, if the server names CAs, one of its certificates was issued by one of them; otherwise an empty Certificate | asks per `cfg.client_auth`, Go's modes: `NO_CLIENT_CERT` (the default), `REQUEST_CLIENT_CERT`, `REQUIRE_ANY_CLIENT_CERT`, `VERIFY_CLIENT_CERT_IF_GIVEN`, `REQUIRE_AND_VERIFY_CLIENT_CERT`; names the CAs of `cfg.client_cas` and checks chains against them (the system's roots when empty, as Go) for client authentication; `tls::peer_certificates(c)`, `tls::peer_verified(c)` |
 | ALPN | `cfg.alpn` offered | its first protocol the client offered, or `no_application_protocol` |
 | Resumption | offers `cfg.session` when it is unexpired, for `cfg.server_name`, and one of `cfg.suites` has its hash (also after a HelloRetryRequest); `tls::session(c)` is the latest ticket's session | takes a ticket sealed under `cfg.ticket_key` that is unexpired and of the suite's hash, checking its binder; sends `cfg.tickets` tickets (1, as Go) to clients that allow psk_dhe_ke |
 | After the handshake | NewSessionTicket kept as the session; KeyUpdate both ways (`key_update(c, request, out)`) | KeyUpdate; `send_session_ticket(c, cfg, out)` for another ticket |
@@ -90,8 +91,37 @@ received, and `c.error` the x509 error behind a certificate alert. Every
 random value comes from an HMAC-DRBG seeded from the OS. A config's
 `seed` fixes it, for tests.
 
-Not supported: 0-RTT, external PSKs, client certificates (a request is
-answered with an empty Certificate), and TLS 1.2 or older.
+Not supported: 0-RTT, external PSKs, post-handshake client
+authentication, and TLS 1.2 or older.
+
+### Client certificates
+
+```goose
+var sc, ok = tls::server_config(chain, key);
+sc.client_auth = tls::REQUIRE_AND_VERIFY_CLIENT_CERT;
+x509::pool_add_file(sc.client_cas, "clients-ca.pem");
+...                                             // once connected:
+tls::peer_certificates(c)                       // the client's chain, DER concatenated
+tls::peer_verified(c)                           // checked against sc.client_cas
+
+var cc = tls::client_config("example.com", roots);
+tls::set_client_certificate(cc, client_chain, client_key);
+```
+
+A server that asks sends a CertificateRequest with its signature schemes
+and the names of its client CAs. A missing certificate where one is
+required fails with certificate_required. A checked chain must lead to a
+client CA and allow client authentication (x509's
+`verify_client_with_roots`, through the new `Options.key_usages`).
+Whenever the client sends a certificate, its CertificateVerify must
+verify, checked or not.
+
+Resumed connections carry the client's certificate over in the ticket,
+with whether it was checked. As in Go, a ticket is not taken when:
+- one is required now and the ticket has none;
+- none is asked for and the ticket has one;
+- the certificate has expired;
+- certificates are checked now and this one was not.
 
 ### Resumption
 
@@ -118,7 +148,8 @@ A resumed connection skips the server's Certificate and
 CertificateVerify, so `c.chain` is empty.
 
 The server keeps nothing: each ticket seals the session's state (suite,
-PSK, creation time, age_add, ALPN, server name) with ChaCha20-Poly1305
+PSK, creation time, age_add, ALPN, server name, the client's certificate)
+with ChaCha20-Poly1305
 under `cfg.ticket_key`. That key is random per `server_config`, so share
 it to let several servers resume each other's sessions. A ticket it cannot
 open, from another suite's hash, or older than its lifetime gives a full
@@ -187,7 +218,17 @@ python3 scripts/run_tests.py --native   # also built with the C compiler
   - is not offered expired or for another name;
   - a changed binder is refused.
 
-`scripts/live_interop.py` runs live connections against OpenSSL (73
+- `client_auth`: client certificates under each of the five modes:
+  - requested or not, required or not, checked or not;
+  - with P-256, P-384, Ed25519, RSA (RSA-PSS), ML-DSA-44 and ML-DSA-65
+    keys;
+  - refused for server authentication only, for an unknown CA, and for a
+    key that is not the certificate's;
+  - not sent when the server names other CAs;
+  - carried over by resumption, or a full handshake under Go's rules for
+    tickets.
+
+`scripts/live_interop.py` runs live connections against OpenSSL (86
 cases). It builds `tools/peer.goose`, a peer driven over stdin and stdout,
 and relays its bytes to Python's ssl module through memory BIOs. It
 covers:
@@ -206,6 +247,10 @@ covers:
 - ALPN both ways, a KeyUpdate that OpenSSL answers, and close_notify;
 - resumption both ways, also after a HelloRetryRequest: the first
   connection full and the second resumed, by both sides' account;
+- client certificates both ways: this client's (P-256, Ed25519, ML-DSA-44)
+  to an OpenSSL server that requires one, none where one is optional or
+  required, and one OpenSSL refuses; an OpenSSL client's to this server,
+  checked, missing, unchecked, or refused for its usage or CA;
 - roots from a directory; an untrusted root, the system's roots (which lack
   the test root), and a wrong name.
 
@@ -213,7 +258,9 @@ covers:
 (`scripts/gointerop`, standard library only) over sockets on 127.0.0.1.
 It checks resumption both ways: this client with a Go server's ticket, and
 a Go client with a session cache against this server. Both sides must
-report the second connection resumed.
+report the second connection resumed. The same runs again with client
+certificates, which each server requires and checks, so they must survive
+resumption.
 
 The compiler is found as in bignum: `--goose`, `$GOOSE`, `goose` on PATH,
 then `../goose.git/build/goose`.

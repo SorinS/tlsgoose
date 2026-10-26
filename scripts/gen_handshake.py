@@ -3,10 +3,14 @@
 key type (Ed25519, P-256, P-384, P-521, RSA-2048, ML-DSA-44/65/87) for
 example.com, made by
 openssl, with each private key in PKCS #8 and in its own format (SEC 1 for
-EC, PKCS #1 for RSA):
+EC, PKCS #1 for RSA); then a CA for clients and client certificates it
+issued (P-256, Ed25519 and ML-DSA-44 for client authentication, and a
+P-256 one for server authentication only):
 
     root <DER hex> <PKCS #8 key hex>
     server <type> <certificate DER hex> <PKCS #8 hex> <native hex or ->
+    clientca <DER hex> <PKCS #8 key hex>
+    client <type> <certificate DER hex> <PKCS #8 hex>
 
     python3 scripts/gen_handshake.py
 """
@@ -60,6 +64,30 @@ def main():
                     f.write(open(p(f"{kind}.{ext}")).read())
         with open(os.path.join(ROOT, "test", "vectors", "hs_root.pem"), "w") as f:
             f.write(open(p("root.pem")).read())
+        ossl("req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+             "-subj", "/O=Goose TLS Test/CN=Test Client CA", "-days", "7300", "-keyout", p("clientca.key"),
+             "-out", p("clientca.pem"), "-addext", "basicConstraints=critical,CA:TRUE",
+             "-addext", "keyUsage=critical,keyCertSign,cRLSign")
+        lines.append(f"clientca {der(p('clientca.pem')).hex()} {key8(p('clientca.key')).hex()}")
+        for kind, args, eku in [("p256", ["-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256"], "clientAuth"),
+                                ("ed25519", ["-algorithm", "ED25519"], "clientAuth"),
+                                ("mldsa44", ["-algorithm", "ML-DSA-44"], "clientAuth"),
+                                ("serveronly", ["-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256"],
+                                 "serverAuth")]:
+            with open(p("cext"), "w") as f:
+                f.write("basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n"
+                        f"extendedKeyUsage={eku}\n")
+            ossl("genpkey", *args, "-out", p(f"c{kind}.key"))
+            ossl("req", "-new", "-key", p(f"c{kind}.key"), "-subj", f"/CN=goose client {kind}",
+                 "-out", p(f"c{kind}.csr"))
+            ossl("x509", "-req", "-in", p(f"c{kind}.csr"), "-CA", p("clientca.pem"), "-CAkey", p("clientca.key"),
+                 "-days", "7000", "-extfile", p("cext"), "-out", p(f"c{kind}.pem"))
+            lines.append(f"client {kind} {der(p('c' + kind + '.pem')).hex()} {key8(p('c' + kind + '.key')).hex()}")
+            for ext in ("pem", "key"):
+                with open(os.path.join(ROOT, "test", "vectors", f"hs_client_{kind}.{ext}"), "w") as f:
+                    f.write(open(p(f"c{kind}.{ext}")).read())
+        with open(os.path.join(ROOT, "test", "vectors", "hs_clientca.pem"), "w") as f:
+            f.write(open(p("clientca.pem")).read())
     with open(os.path.join(ROOT, "test", "vectors", "hs_certs.txt"), "w") as f:
         f.write("\n".join(lines) + "\n")
     print(f"wrote {len(lines)} lines")

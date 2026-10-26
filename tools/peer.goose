@@ -2,16 +2,20 @@
 // the script relays the bytes between this program and OpenSSL.
 //
 //   peer client <host> <roots.pem | roots directory | system> [--suite 1301] [--group 001d] [--alpn h2] [--now N]
+//               [--cert chain.pem --key key.pem]
 //   peer server <chain.pem> <key.pem> [--suite ...] [--group ...] [--alpn ...]
+//               [--client-auth 0-4] [--client-cas cas.pem]
 //
 // Commands, one per line: "IN <hex>" (bytes from the network), "SEND
 // <hex>" (application data), "KEYUPDATE", "CLOSE", "SESSION" (the
 // client's latest session, as tls::session_bytes). After the client's
 // start and after each command the peer prints "OUT <hex>" if it has bytes
 // to send, "APP <hex>" if it received data, "SESSION <hex|->" when asked,
-// then "STATE <state> <alert> <alpn> <group> <resumed>" and "END".
-// --session <hex> gives the client a session to resume, --ticket-key
-// <hex> the server its ticket key.
+// then "STATE <state> <alert> <alpn> <group> <resumed> <peer certificate
+// bytes> <peer verified>" and "END". --session <hex> gives the client a
+// session to resume, --ticket-key <hex> the server its ticket key; --cert
+// and --key the client a certificate, --client-auth (tls::NO_CLIENT_CERT
+// ...) and --client-cas the server what it asks of clients.
 import std;
 import os;
 import tls from "..";
@@ -52,7 +56,7 @@ fn report(c: const tls::Conn&, out: const u8[:], app: const u8[:]) {
     if out.len > 0 { print("OUT ", hex(out)); }
     if app.len > 0 { print("APP ", hex(app)); }
     print("STATE ", c.state, " ", c.alert, " ", if c.alpn.len > 0 { c.alpn[..] } else { "-" }, " ", c.group, " ",
-          if tls::resumed(c) { 1 } else { 0 });
+          if tls::resumed(c) { 1 } else { 0 }, " ", c.chain.len, " ", if tls::peer_verified(c) { 1 } else { 0 });
     print("END");
     flush_stdout();
 }
@@ -77,6 +81,7 @@ fn main() {
     var sc, okk = tls::server_config(chain, key_der);
     if is_server && !okk { write_stderr("bad key\n"); assert(false); }
     var i = 4;
+    var cert_path: u8[>..] = [];
     var suites_set = false;
     var groups_set = false;
     while i + 1 < a.len {
@@ -102,6 +107,18 @@ fn main() {
         } else if a[i] == "--ticket-key" {
             let k = unhex(a[i + 1]);
             for j in 32 { sc.ticket_key[j] = k[j]; }
+        } else if a[i] == "--cert" {
+            cert_path.append(a[i + 1]);
+        } else if a[i] == "--key" {
+            if !tls::set_client_certificate(cc, pem_der(cert_path, "CERTIFICATE"), pem_der(a[i + 1], "PRIVATE KEY")) {
+                write_stderr("bad client key\n");
+                assert(false);
+            }
+        } else if a[i] == "--client-auth" {
+            let v, ok = parse_int(a[i + 1], 10);
+            sc.client_auth = v;
+        } else if a[i] == "--client-cas" {
+            let n = x509::pool_add_file(sc.client_cas, a[i + 1]);
         } else if a[i] == "--now" {
             let v, ok = parse_int(a[i + 1], 10);
             cc.now = v;

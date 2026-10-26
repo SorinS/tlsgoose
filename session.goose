@@ -21,7 +21,7 @@ let MAX_TICKET_LIFETIME: i64 = 604800;
 struct Session {
     suite: u16, psk: u8[..48], age_add: u32, lifetime: i64, received_ms: i64,
     server_name: u8[..255], alpn: u8[..255], not_after: i64, max_early_data: u32,
-    ticket: u8[..4096],
+    ticket: u8[..16384],
 }
 
 fn no_session() -> Session {
@@ -106,7 +106,7 @@ fn parse_session(b: const u8[:]) -> Session, bool {
     s.alpn.append(sess_get_vec(r, b, 1, 255));
     s.not_after = sess_get(r, b, 8) as! i64;
     s.max_early_data = sess_get(r, b, 4) as! u32;
-    s.ticket.append(sess_get_vec(r, b, 2, 4096));
+    s.ticket.append(sess_get_vec(r, b, 2, 16384));
     let st, oks = suite(s.suite);
     if r.bad || r.pos != b.len || !oks || s.psk.len != hash_len(st) || s.lifetime > MAX_TICKET_LIFETIME {
         return no_session(), false;
@@ -117,13 +117,15 @@ fn parse_session(b: const u8[:]) -> Session, bool {
 // --- Tickets -------------------------------------------------------------------
 
 // What a server's ticket carries, sealed: the suite, the PSK, when it was
-// made (seconds), its age_add and lifetime, and the ALPN protocol and server
-// name of the connection.
+// made (seconds), its age_add and lifetime, the ALPN protocol and server
+// name of the connection, and the client's certificates (none when empty),
+// whether they were checked, and the leaf's notAfter.
 struct TicketState {
     suite: u16, psk: u8[..48], created: i64, age_add: u32, lifetime: i64, alpn: u8[..255], sni: u8[..255],
+    client_not_after: i64, client_verified: bool, client_chain: u8[..12288],
 }
 
-let TICKET_AAD: const u8[:] = "goose tls 1.3 ticket v1";
+let TICKET_AAD: const u8[:] = "goose tls 1.3 ticket v2";
 
 // A ticket: a 12-byte nonce, then the state sealed with ChaCha20-Poly1305
 // under the server's 32-byte ticket key.
@@ -137,6 +139,9 @@ fn seal_ticket(key: const u8[:], nonce: const u8[:], t: const TicketState&) -> u
     sess_put(plain, t.lifetime as! u64, 4);
     sess_vec(plain, t.alpn, 1);
     sess_vec(plain, t.sni, 1);
+    sess_put(plain, t.client_not_after as! u64, 8);
+    sess_put(plain, if t.client_verified { 1 } else { 0 }, 1);
+    sess_vec(plain, t.client_chain, 2);
     var out: u8[>..] = [];
     out.append(nonce);
     out.append(bignum::chacha20_poly1305_seal(key, nonce, TICKET_AAD, plain));
@@ -145,7 +150,8 @@ fn seal_ticket(key: const u8[:], nonce: const u8[:], t: const TicketState&) -> u
 
 // The state of a ticket this key sealed; false for any other bytes.
 fn open_ticket(key: const u8[:], ticket: const u8[:]) -> TicketState, bool {
-    var t = TicketState { suite: 0, psk: [], created: 0, age_add: 0, lifetime: 0, alpn: [], sni: [] };
+    var t = TicketState { suite: 0, psk: [], created: 0, age_add: 0, lifetime: 0, alpn: [], sni: [],
+                          client_not_after: 0, client_verified: false, client_chain: [] };
     if ticket.len < 12 + 16 { return t, false; }
     let plain, ok = bignum::chacha20_poly1305_open(key, ticket[..12], TICKET_AAD, ticket[12..]);
     if !ok { return t, false; }
@@ -157,7 +163,11 @@ fn open_ticket(key: const u8[:], ticket: const u8[:]) -> TicketState, bool {
     t.lifetime = sess_get(r, plain, 4) as! i64;
     t.alpn.append(sess_get_vec(r, plain, 1, 255));
     t.sni.append(sess_get_vec(r, plain, 1, 255));
+    t.client_not_after = sess_get(r, plain, 8) as! i64;
+    let verified = sess_get(r, plain, 1);
+    t.client_verified = verified == 1;
+    t.client_chain.append(sess_get_vec(r, plain, 2, 12288));
     let st, oks = suite(t.suite);
-    if r.bad || r.pos != plain.len || !oks || t.psk.len != hash_len(st) { return t, false; }
+    if r.bad || r.pos != plain.len || verified > 1 || !oks || t.psk.len != hash_len(st) { return t, false; }
     return t, true;
 }

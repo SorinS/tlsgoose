@@ -5,7 +5,8 @@ connects twice to a Go server, the second time with the session from the
 first one's ticket; then a Go client with a session cache connects twice to
 this package's server (one ticket key for both connections). Each side must
 report the first connection full and the second resumed, and data must
-cross both ways.
+cross both ways. Then the same with client certificates, which each
+server requires and checks, carried over by resumption.
 
     python3 scripts/go_interop.py [--goose PATH]
 """
@@ -47,10 +48,11 @@ def relay_until(peer, sock, done):
     return app
 
 
-def goose_client_go_server(exe, gobin):
+def goose_client_go_server(exe, gobin, client_cert=False):
     port = free_port()
+    extra = [os.path.join(VEC, "hs_clientca.pem")] if client_cert else []
     srv = subprocess.Popen([gobin, "server", os.path.join(VEC, "hs_p256.pem"), os.path.join(VEC, "hs_p256.key"),
-                            str(port)], stdout=subprocess.PIPE, text=True)
+                            str(port), *extra], stdout=subprocess.PIPE, text=True)
     assert srv.stdout.readline().strip() == "ready"
     session, results = None, []
     try:
@@ -58,6 +60,9 @@ def goose_client_go_server(exe, gobin):
             args = ["client", "example.com", os.path.join(VEC, "hs_root.pem")]
             if session:
                 args += ["--session", session]
+            if client_cert:
+                args += ["--cert", os.path.join(VEC, "hs_client_ed25519.pem"),
+                         "--key", os.path.join(VEC, "hs_client_ed25519.key")]
             peer = Peer(exe, args)
             sock = socket.create_connection(("127.0.0.1", port), timeout=10)
             out, _ = peer.read()
@@ -77,24 +82,28 @@ def goose_client_go_server(exe, gobin):
             peer.close()
     finally:
         srv.kill()
-    want = [(False, "echo hello 0 resumed=false"), (True, "echo hello 1 resumed=true")]
+    client = "goose client ed25519" if client_cert else "-"
+    want = [(False, f"echo hello 0 resumed=false client={client}"), (True, f"echo hello 1 resumed=true client={client}")]
     return results == want, results
 
 
-def go_client_goose_server(exe, gobin):
+def go_client_goose_server(exe, gobin, client_cert=False):
     ls = socket.socket()
     ls.bind(("127.0.0.1", 0))
     ls.listen(2)
     port = ls.getsockname()[1]
-    cli = subprocess.Popen([gobin, "client", str(port), os.path.join(VEC, "hs_root.pem"), "2"],
+    extra = [os.path.join(VEC, "hs_client_p256.pem"), os.path.join(VEC, "hs_client_p256.key")] if client_cert else []
+    cli = subprocess.Popen([gobin, "client", str(port), os.path.join(VEC, "hs_root.pem"), "2", *extra],
                            stdout=subprocess.PIPE, text=True)
     key = os.urandom(32).hex()
     ours = []
     for i in range(2):
         sock, _ = ls.accept()
         sock.settimeout(10)
-        peer = Peer(exe, ["server", os.path.join(VEC, "hs_ed25519.pem"), os.path.join(VEC, "hs_ed25519.key"),
-                          "--ticket-key", key])
+        args = ["server", os.path.join(VEC, "hs_ed25519.pem"), os.path.join(VEC, "hs_ed25519.key"), "--ticket-key", key]
+        if client_cert:
+            args += ["--client-auth", "4", "--client-cas", os.path.join(VEC, "hs_clientca.pem")]
+        peer = Peer(exe, args)
         app = b""
         for _ in range(50):
             data = sock.recv(65536)
@@ -106,6 +115,9 @@ def go_client_goose_server(exe, gobin):
             app += got
             if app.endswith(b"\n"):
                 resumed = peer.state[4]
+                # With client certificates, this server must hold a checked one.
+                if client_cert and not (peer.state[5] > 0 and peer.state[6]):
+                    resumed = None
                 out, _ = peer.cmd("SEND " + f"echo {app[:-1].decode()} resumed={str(resumed).lower()}".encode().hex())
                 sock.sendall(out)
                 ours.append(resumed)
@@ -135,10 +147,12 @@ def main():
     subprocess.run(["go", "build", "-o", gobin, "."], cwd=GO, check=True,
                    env={**os.environ, "GOFLAGS": "-mod=mod", "GOPROXY": "off"})
     passed = 0
-    cases = [("goose client resumes with a Go server's ticket", goose_client_go_server),
-             ("Go client resumes with this server's ticket", go_client_goose_server)]
-    for label, fn in cases:
-        ok, detail = fn(exe, gobin)
+    cases = [("goose client resumes with a Go server's ticket", goose_client_go_server, False),
+             ("Go client resumes with this server's ticket", go_client_goose_server, False),
+             ("goose client's certificate to a Go server, resumed", goose_client_go_server, True),
+             ("Go client's certificate to this server, resumed", go_client_goose_server, True)]
+    for label, fn, cc in cases:
+        ok, detail = fn(exe, gobin, cc)
         print(("ok    " if ok else "FAIL  ") + label + ("" if ok else f"\n      {detail}"))
         passed += ok
     shutil.rmtree(tmp)
