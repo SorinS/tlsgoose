@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Make test/vectors/hs_certs.txt: a root CA and one server certificate per
-key type (Ed25519, P-256, P-384, RSA-2048) for example.com, made by
+key type (Ed25519, P-256, P-384, P-521, RSA-2048, ML-DSA-44/65/87) for
+example.com, made by
 openssl, with each private key in PKCS #8 and in its own format (SEC 1 for
 EC, PKCS #1 for RSA):
 
@@ -39,7 +40,10 @@ def main():
                            ("p256", ["-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256"]),
                            ("p384", ["-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-384"]),
                            ("p521", ["-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-521"]),
-                           ("rsa", ["-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048"])]:
+                           ("rsa", ["-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048"]),
+                           ("mldsa44", ["-algorithm", "ML-DSA-44"]),
+                           ("mldsa65", ["-algorithm", "ML-DSA-65"]),
+                           ("mldsa87", ["-algorithm", "ML-DSA-87"])]:
             ossl("genpkey", *args, "-out", p(f"{kind}.key"))
             ossl("req", "-new", "-key", p(f"{kind}.key"), "-subj", "/CN=example.com", "-out", p(f"{kind}.csr"))
             ossl("x509", "-req", "-in", p(f"{kind}.csr"), "-CA", p("root.pem"), "-CAkey", p("root.key"),

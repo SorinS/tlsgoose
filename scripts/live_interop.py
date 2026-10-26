@@ -7,7 +7,7 @@ relays every byte between them. Each case runs in a child process whose
 OPENSSL_CONF pins OpenSSL's suites and groups when the case needs it.
 
 Cases: the Goose client against an OpenSSL server for each certificate
-type, cipher suite and group, with a HelloRetryRequest, ALPN, and a
+type (ML-DSA ones included), cipher suite and group, with a HelloRetryRequest, ALPN, and a
 KeyUpdate; the Goose server against an OpenSSL client likewise (which
 offers its post-quantum hybrid first and so takes X25519 or a retry);
 and failures: an untrusted root and a wrong host name.
@@ -187,6 +187,9 @@ def main():
                           openssl_groups=GROUPS[g], want=True, want_group=int(g, 16)))
         cases.append(dict(name=f"goose server, {GROUPS[g]}", role="server", cert="rsa", goose_groups=[g],
                           openssl_groups=GROUPS[g], want=True, want_group=int(g, 16)))
+    for cert in ("mldsa44", "mldsa65", "mldsa87"):
+        cases.append(dict(name=f"goose client, {cert} server", role="client", cert=cert, want=True))
+        cases.append(dict(name=f"goose {cert} server", role="server", cert=cert, want=True))
     cases += [
         dict(name="goose client, HelloRetryRequest to SecP384r1MLKEM1024", role="client", cert="p256",
              openssl_groups="SecP384r1MLKEM1024", want=True, want_group=0x11ed),

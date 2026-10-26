@@ -66,14 +66,14 @@ tls::close(c, out);
 A server is the same, built from
 `tls::server_config(chain_der, key_der) -> ServerConfig, bool`, with
 `tls::server(cfg)` and `tls::server_feed`. The key may be PKCS #8 (RSA,
-EC, Ed25519), SEC 1 or PKCS #1 DER.
+EC, Ed25519, ML-DSA), SEC 1 or PKCS #1 DER.
 
 | | Client | Server |
 |---|---|---|
 | Suites | all three, in `cfg.suites` order | its own order of preference |
 | Key exchange | The post-quantum X25519MLKEM768 (the default), SecP256r1MLKEM768 and SecP384r1MLKEM1024 hybrids and MLKEM1024 alone; X25519, P-256, P-384, P-521. The defaults are Go's: everything but MLKEM1024. The client sends a share for the first of `cfg.groups` (plus, beside a hybrid, a share of its ECDH part on the same key, as Go does) and reaches the others through HelloRetryRequest | its first group the client has a share for, else a HelloRetryRequest for its first group the client supports |
-| Certificates | checked by `x509::verify_chain`: chain to `cfg.roots`, name `cfg.server_name`, time `cfg.now` (0 for now); `cfg.verify = false` skips it | sends `cfg.chain`, signs CertificateVerify with RSA-PSS, ECDSA (P-256, P-384, P-521) or Ed25519 as its key and the client allow |
-| CertificateVerify | RSA-PSS, RSA PKCS #1 v1.5, ECDSA P-256/P-384/P-521, Ed25519 | |
+| Certificates | checked by `x509::verify_chain`: chain to `cfg.roots`, name `cfg.server_name`, time `cfg.now` (0 for now); `cfg.verify = false` skips it | sends `cfg.chain`, signs CertificateVerify with RSA-PSS, ECDSA (P-256, P-384, P-521), Ed25519 or ML-DSA as its key and the client allow |
+| CertificateVerify | ML-DSA-44/65/87 (draft-ietf-tls-mldsa, offered first, as Go does), RSA-PSS, RSA PKCS #1 v1.5, ECDSA P-256/P-384/P-521, Ed25519 | |
 | ALPN | `cfg.alpn` offered | its first protocol the client offered, or `no_application_protocol` |
 | After the handshake | NewSessionTicket counted and dropped; KeyUpdate both ways (`key_update(c, request, out)`) | KeyUpdate |
 
@@ -138,18 +138,19 @@ python3 scripts/run_tests.py --native   # also built with the C compiler
   transcript, exporters.
 
 - `handshake`: this package's client against its server in memory, for
-  every server key type with each suite and group. Each run includes
+  every server key type (ML-DSA included) with each suite and group. Each run includes
   HelloRetryRequest, ALPN, data both ways, KeyUpdate and close_notify.
   The failures covered: an unknown CA, a wrong name, an expired
   certificate, no common suite or group, an ALPN mismatch, and a changed
   record. Input is also fed a byte at a time.
 
-`scripts/live_interop.py` runs live connections against OpenSSL (61
+`scripts/live_interop.py` runs live connections against OpenSSL (67
 cases). It builds `tools/peer.goose`, a peer driven over stdin and stdout,
 and relays its bytes to Python's ssl module through memory BIOs. It
 covers:
 - this client against an OpenSSL server, and this server against an
-  OpenSSL client, for each certificate type, suite and group;
+  OpenSSL client, for each certificate type, suite and group, and with
+  ML-DSA-44, ML-DSA-65 and ML-DSA-87 certificates;
 - X25519MLKEM768 by default, alone, and after a HelloRetryRequest, in
   both roles (so OpenSSL decapsulates this package's ML-KEM ciphertexts
   and encapsulates to its keys), and the X25519 fallback for a server

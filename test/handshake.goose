@@ -1,9 +1,9 @@
 // TLS 1.3 handshakes between this package's client and server, in
-// memory: every server key type (Ed25519, P-256, P-384, P-521, RSA) with
-// every cipher suite and key exchange group, HelloRetryRequest, ALPN,
-// application data both ways, KeyUpdate, close_notify, and the failures a
-// client must report: an untrusted root, a wrong name, a changed record,
-// no common suite or group.
+// memory: every server key type (Ed25519, P-256, P-384, P-521, RSA,
+// ML-DSA-44/65/87) with every cipher suite and key exchange group,
+// HelloRetryRequest, ALPN, application data both ways, KeyUpdate,
+// close_notify, and the failures a client must report: an untrusted root,
+// a wrong name, a changed record, no common suite or group.
 import std;
 import tls from "..";
 import bignum from "../../bigmongoose.git";
@@ -122,7 +122,7 @@ fn handshake_alert(cc: const tls::ClientConfig&, sc: const tls::ServerConfig&) -
 }
 
 fn main() {
-    let kinds = ["ed25519", "p256", "p384", "p521", "rsa"];
+    let kinds = ["ed25519", "p256", "p384", "p521", "rsa", "mldsa44", "mldsa65", "mldsa87"];
     let suites: u16[4] = [tls::TLS_AES_128_GCM_SHA256, tls::TLS_AES_256_GCM_SHA384, tls::TLS_CHACHA20_POLY1305_SHA256,
                           tls::TLS_AES_128_GCM_SHA256];
     let groups: u16[4] = [tls::GROUP_X25519MLKEM768, tls::GROUP_SECP256R1, tls::GROUP_SECP384R1, tls::GROUP_SECP521R1];

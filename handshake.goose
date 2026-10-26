@@ -83,8 +83,10 @@ let HRR_RANDOM: u8[32] = [
     0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
 ];
 
-// The signature schemes offered and accepted, most preferred first.
-let SIG_SCHEMES: u16[10] = [0x0403, 0x0503, 0x0603, 0x0807, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601];
+// The signature schemes offered and accepted, most preferred first: ML-DSA
+// (draft-ietf-tls-mldsa) first, as Go has them.
+let SIG_SCHEMES: u16[13] = [0x0904, 0x0905, 0x0906, 0x0403, 0x0503, 0x0603, 0x0807, 0x0804, 0x0805, 0x0806,
+                            0x0401, 0x0501, 0x0601];
 
 let MAX_HANDSHAKE: i64 = 65536;
 
@@ -510,6 +512,10 @@ fn offered_scheme(list: const u16[:], s: u16) -> bool {
 // for none.
 fn pick_scheme(cfg: const ServerConfig&, peer: const u16[:]) -> u16 {
     if cfg.key.kind == x509::KEY_ED25519 && offered_scheme(peer, x509::ED25519) { return x509::ED25519; }
+    if x509::is_mldsa(cfg.key.kind) {
+        let s = x509::mldsa_scheme(x509::mldsa_set(cfg.key.kind));
+        if offered_scheme(peer, s) { return s; }
+    }
     if cfg.key.kind == x509::KEY_EC_P256 && offered_scheme(peer, x509::ECDSA_SECP256R1_SHA256) { return x509::ECDSA_SECP256R1_SHA256; }
     if cfg.key.kind == x509::KEY_EC_P384 && offered_scheme(peer, x509::ECDSA_SECP384R1_SHA384) { return x509::ECDSA_SECP384R1_SHA384; }
     if cfg.key.kind == x509::KEY_EC_P521 && offered_scheme(peer, x509::ECDSA_SECP521R1_SHA512) { return x509::ECDSA_SECP521R1_SHA512; }
@@ -523,6 +529,9 @@ fn pick_scheme(cfg: const ServerConfig&, peer: const u16[:]) -> u16 {
 
 fn sign(cfg: const ServerConfig&, scheme: u16, msg: const u8[:]) -> u8[>..] {
     if scheme == x509::ED25519 { return x509::sign(cfg.key, x509::SIG_ED25519, 0, msg); }
+    if scheme == x509::MLDSA44 || scheme == x509::MLDSA65 || scheme == x509::MLDSA87 {
+        return x509::sign(cfg.key, x509::SIG_MLDSA, x509::mldsa_set(cfg.key.kind), msg);
+    }
     if scheme == x509::ECDSA_SECP256R1_SHA256 { return x509::sign(cfg.key, x509::SIG_ECDSA, 256, msg); }
     if scheme == x509::ECDSA_SECP384R1_SHA384 { return x509::sign(cfg.key, x509::SIG_ECDSA, 384, msg); }
     if scheme == x509::ECDSA_SECP521R1_SHA512 { return x509::sign(cfg.key, x509::SIG_ECDSA, 512, msg); }
