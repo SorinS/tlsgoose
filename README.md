@@ -320,7 +320,19 @@ older, and renegotiation.
 ```bash
 python3 scripts/run_tests.py            # at -O0, -O2 and --debug
 python3 scripts/run_tests.py --native   # also built with the C compiler
+python3 scripts/live_interop.py         # live, against OpenSSL (below)
+python3 scripts/go_interop.py           # live, against Go's crypto/tls (below)
+python3 scripts/gen_handshake.py        # remake vectors/hs_certs.txt
+python3 scripts/openssl_interop.py      # recapture vectors of OpenSSL's connections
+python3 scripts/rfc8448.py              # re-extract RFC 8448's trace (fetches the RFC)
+tools/gointerop.sh <mode> ...           # Go's side by hand (modes in tools/gointerop/main.go)
 ```
+
+They take the compiler from `--goose`, `$GOOSE`, `goose` on PATH or
+`../goose.git/build/goose`, and asn1goose.git, bigmongoose.git and
+x509goose.git beside this repository. The live scripts run everything on
+127.0.0.1 and leave nothing running; go_interop.py needs Go (standard
+library only).
 
 - `rfc8448`: the simple 1-RTT handshake of RFC 8448 §3, end to end. It
   starts from the two X25519 key pairs, runs every secret, key and
@@ -426,7 +438,8 @@ covers:
   without the extended master secret; client certificates; ALPN.
 
 `scripts/go_interop.py` runs this package against Go's crypto/tls
-(`scripts/gointerop`, standard library only) over sockets on 127.0.0.1.
+(`tools/gointerop`, standard library only; `tools/gointerop.sh` runs it
+by hand) over sockets on 127.0.0.1.
 It checks resumption both ways: this client with a Go server's ticket, and
 a Go client with a session cache against this server. Both sides must
 report the second connection resumed. The same runs again with client

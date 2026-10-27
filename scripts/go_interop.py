@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live TLS 1.3 against Go's crypto/tls (scripts/gointerop), over sockets
+"""Live TLS 1.3 against Go's crypto/tls (tools/gointerop), over sockets
 on 127.0.0.1, with resumption: this package's client (tools/peer.goose)
 connects twice to a Go server, the second time with the session from the
 first one's ticket; then a Go client with a session cache connects twice to
@@ -28,7 +28,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(__file__))
 from live_interop import Peer, ROOT, VEC  # noqa: E402
 
-GO = os.path.join(ROOT, "scripts", "gointerop")
+GO = os.path.join(ROOT, "tools", "gointerop")
 
 
 def free_port():
@@ -257,7 +257,7 @@ def main():
     subprocess.run([goose, "build", "-o", exe, os.path.join(ROOT, "tools", "peer.goose")], check=True,
                    capture_output=True)
     subprocess.run(["go", "build", "-o", gobin, "."], cwd=GO, check=True,
-                   env={**os.environ, "GOFLAGS": "-mod=mod", "GOPROXY": "off"})
+                   env={**os.environ, "GOFLAGS": "-mod=mod", "GOPROXY": "off", "GOSUMDB": "off"})
     passed = 0
     cases = [("goose client resumes with a Go server's ticket", goose_client_go_server, False),
              ("Go client resumes with this server's ticket", go_client_goose_server, False),
