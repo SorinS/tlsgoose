@@ -20,6 +20,9 @@ received. The caller owns the socket, or the pipe, or the test harness.
   their configurations, and key loading.
 - **`tls.session`**: `Session`, what a client keeps to resume, as bytes
   too, and the server's sealed tickets.
+- **`tls.ech`**: Encrypted Client Hello: ECHConfig and ECHConfigList
+  encoding, picking a config, server key generation, the accept
+  confirmation, and rebuilding a ClientHelloInner.
 - **`tls.record`**: plaintext and protected records, the per-record nonce,
   content-type hiding and padding, size limits with the alert each failure
   calls for, fragmenting long data, and framing records and handshake
@@ -155,6 +158,59 @@ it to let several servers resume each other's sessions. A ticket it cannot
 open, from another suite's hash, or older than its lifetime gives a full
 handshake. A wrong binder fails the handshake with decrypt_error.
 
+### Encrypted Client Hello
+
+ECH (RFC 9849) hides the real ClientHello, server name included, inside
+an outer one that names only the config's public name. It works as Go's
+does:
+
+```goose
+// The server: a key, its ECHConfig published to clients (in DNS, say).
+let config, sk = tls::generate_ech_key(1, bignum::HPKE_DHKEM_X25519, "public.example.com");
+tls::add_ech_key(sc, config, sk, true);          // true: sent as a retry config
+let list = tls::ech_config_list(config);
+
+// The client.
+cc.ech_config_list.append(list);                 // e.g. from the HTTPS record's ech= value
+...                                              // once connected:
+tls::ech_accepted(c)
+```
+
+The client:
+- picks the first usable config, as Go does: this version, a valid public
+  name, no mandatory extension, a KEM this package has, and an HKDF and a
+  sealing AEAD;
+- builds the inner ClientHello, with the real name, the PSK when
+  resuming, and the shared extensions compressed into
+  ech_outer_extensions;
+- pads it as Go does, and seals it with HPKE under the config's key. The
+  outer ClientHello is the AAD.
+
+The outer ClientHello has its own random, the same key shares and no PSK.
+
+Acceptance is read from the confirmation in the ServerHello's random, or
+in the HelloRetryRequest. After a HelloRetryRequest the second ClientHello
+seals with the same HPKE context.
+
+When ECH is not accepted, the client finishes the handshake with the
+public name:
+- the certificate must be valid for that name;
+- a certificate request is answered with none.
+
+It then fails with `ech_required`, and `tls::ech_retry_configs(c)` holds
+the server's retry configs to try again with.
+
+The server tries each of its keys on an outer ClientHello. With the first
+that opens it, it rebuilds the inner one and goes on with that one: the
+name, the PSK and every other extension. It confirms that in the
+ServerHello, or in a HelloRetryRequest, and checks the second ClientHello
+under the same context. A server none of whose keys opens it goes on with
+the outer one and sends its retry configs. An inner ClientHello sent
+directly, by a client-facing server to a backend, is confirmed as it is.
+
+KEMs: DHKEM X25519, P-256, P-384 and P-521, ML-KEM-768 and ML-KEM-1024,
+and the MLKEM768-X25519, MLKEM768-P256 and MLKEM1024-P384 hybrids.
+
 ## The key schedule
 
 `schedule(hash, psk)` starts from the early secret.
@@ -228,6 +284,21 @@ python3 scripts/run_tests.py --native   # also built with the C compiler
   - carried over by resumption, or a full handshake under Go's rules for
     tickets.
 
+- `ech`: ECH accepted:
+  - with each KEM;
+  - after a HelloRetryRequest, also when resuming;
+  - with ALPN, a client certificate, and resumption.
+
+  Not accepted:
+  - a server without keys, with another key (whose retry configs then
+    work), or without retry configs;
+  - a changed payload;
+  - a certificate request answered with none;
+  - a public name the certificate does not cover.
+
+  Picking configs past unknown versions, mandatory extensions and invalid
+  names, and the padding.
+
 `scripts/live_interop.py` runs live connections against OpenSSL (86
 cases). It builds `tools/peer.goose`, a peer driven over stdin and stdout,
 and relays its bytes to Python's ssl module through memory BIOs. It
@@ -261,6 +332,18 @@ a Go client with a session cache against this server. Both sides must
 report the second connection resumed. The same runs again with client
 certificates, which each server requires and checks, so they must survive
 resumption.
+
+ECH runs both ways for "localhost" behind the public name "example.com",
+16 cases in all:
+- accepted with X25519, P-256, MLKEM768-X25519 and ML-KEM-1024 keys, and
+  after a HelloRetryRequest, both sides reporting it, and the Go server
+  seeing the inner name;
+- refused with another key, each client getting the other server's
+  retry configs.
+
+Live, this client's ECH was also accepted by crypto.cloudflare.com,
+tls-ech.dev (whose page reports "You are using ECH") and defo.ie, with
+configs from their DNS HTTPS records.
 
 The compiler is found as in bignum: `--goose`, `$GOOSE`, `goose` on PATH,
 then `../goose.git/build/goose`.

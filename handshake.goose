@@ -15,7 +15,7 @@
 // HelloRetryRequest; server certificates checked by x509
 // (chain, host name, CertificateVerify) with RSA-PSS, RSA PKCS #1 v1.5,
 // ECDSA, Ed25519 and ML-DSA; client certificates, requested and checked as
-// Go's ClientAuth modes do; ALPN; KeyUpdate; middlebox compatibility mode;
+// Go's ClientAuth modes do; Encrypted Client Hello (tls.ech) both ways; ALPN; KeyUpdate; middlebox compatibility mode;
 // resumption with tickets (psk_dhe_ke, tls.session).
 // Not supported: 0-RTT, external PSKs, post-handshake client
 // authentication, and TLS below 1.3.
@@ -41,6 +41,7 @@ import x509.verify;
 import x509.pool;
 import x509.keys;
 import session;
+import ech;
 
 // Named groups and the signature schemes this package signs and verifies.
 let GROUP_SECP256R1: u16 = 0x0017;
@@ -119,13 +120,16 @@ let MAX_HANDSHAKE: i64 = 65536;
 // resume (from tls::session of an earlier connection; none when its
 // ticket is empty), a certificate chain (concatenated DER, the leaf first;
 // none when empty) and its key for servers that ask for one (set with
-// set_client_certificate), and the trusted roots: the system's
+// set_client_certificate), an ECHConfigList to encrypt the ClientHello
+// under (Go's EncryptedClientHelloConfigList; none when empty), and the
+// trusted roots: the system's
 // (x509::system_roots), or a pool of its own when system_roots is false.
 struct ClientConfig {
     server_name: u8[..255], verify: bool, now: i64,
     groups: u16[..8], suites: u16[..8], alpn: u8[..255], seed: u64,
     session: Session,
     cert_key: x509::PrivateKey, cert_chain: u8[..65536],
+    ech_config_list: u8[..8192],
     system_roots: bool,
     roots: x509::CertPool,
 }
@@ -138,7 +142,7 @@ fn client_config(server_name: const u8[:], roots: const u8[:]) -> ClientConfig {
         groups: [GROUP_X25519MLKEM768, GROUP_SECP256R1MLKEM768, GROUP_SECP384R1MLKEM1024, GROUP_X25519,
                  GROUP_SECP256R1, GROUP_SECP384R1, GROUP_SECP521R1],
         suites: [TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256],
-        alpn: [], seed: 0, session: no_session(), cert_key: x509::empty_key(), cert_chain: [],
+        alpn: [], seed: 0, session: no_session(), cert_key: x509::empty_key(), cert_chain: [], ech_config_list: [],
         system_roots: roots.len == 0, roots: x509::new_pool(),
     };
     c.server_name.append(server_name);
@@ -170,6 +174,26 @@ fn set_client_certificate(cfg: ClientConfig&, chain: const u8[:], key_der: const
     return true;
 }
 
+// Adds an ECH key (Go's EncryptedClientHelloKey): an ECHConfig as clients
+// have it (from generate_ech_key, say) and its HPKE private key; with
+// `send_as_retry`, the config is among the retry configs a client whose
+// ECH was not accepted gets. False if the config is not one or there is
+// no room.
+fn add_ech_key(cfg: ServerConfig&, config: const u8[:], private_key: const u8[:], send_as_retry: bool) -> bool {
+    let kem, id, ok = ech_server_config(config);
+    if !ok || !bignum::hpke_kem_ok(kem) || cfg.ech_keys.len + 5 + config.len + private_key.len > cfg.ech_keys.cap {
+        return false;
+    }
+    var b: u8[>..] = [];
+    put_u16(b, config.len as! u16);
+    b.append(config);
+    put_u16(b, private_key.len as! u16);
+    b.append(private_key);
+    b.push(if send_as_retry { 1 } else { 0 });
+    cfg.ech_keys.append(b);
+    return true;
+}
+
 // Adds a protocol to an ALPN list (wire format: length-prefixed names).
 fn add_alpn(list: u8[..255]&, proto: const u8[:]) {
     assert(proto.len > 0 && proto.len < 256 && list.len + 1 + proto.len <= 255);
@@ -186,13 +210,14 @@ fn add_alpn(list: u8[..255]&, proto: const u8[:]) {
 // DER, the leaf first, what it asks of clients (NO_CLIENT_CERT, ...), and
 // the CAs it accepts client certificates from: named to clients in the
 // request, and the roots their chains are checked against (the system's
-// when there are none, as Go does).
+// when there are none, as Go does), and its ECH keys (add_ech_key).
 struct ServerConfig {
     key: x509::PrivateKey,
     groups: u16[..8], suites: u16[..8], alpn: u8[..255], seed: u64, now: i64,
     tickets: i64, ticket_key: u8[32],
     chain: u8[..65536],
     client_auth: i64,
+    ech_keys: u8[..16384],            // each: config (u16 length), private key (u16 length), send as retry (u8)
     client_cas: x509::CertPool,
 }
 
@@ -206,7 +231,7 @@ fn server_config(chain: const u8[:], key_der: const u8[:]) -> ServerConfig, bool
                  GROUP_SECP256R1, GROUP_SECP384R1, GROUP_SECP521R1],
         suites: [TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256],
         alpn: [], seed: 0, now: 0, tickets: 1, ticket_key: [0; 32], chain: [],
-        client_auth: NO_CLIENT_CERT, client_cas: x509::new_pool(),
+        client_auth: NO_CLIENT_CERT, ech_keys: [], client_cas: x509::new_pool(),
     };
     bignum::random_bytes(s.ticket_key);
     if chain.len > s.chain.cap { return s, false; }
@@ -234,6 +259,17 @@ struct Conn {
     psk_dhe: bool,                     // the client allows psk_dhe_ke, so takes tickets
     peer_not_after: i64,               // the server certificate's notAfter, for sessions (0: unchecked)
     has_session: bool, session: Session,   // the client's latest ticket
+    // ECH: the client offered it, the server got a ClientHello with it,
+    // the server confirms an inner ClientHello (it decrypted it, or it got
+    // one as a backend server), it was accepted; the HPKE context and
+    // suite, the config's id, maximum name length and public name, the
+    // encapsulated key, the outer random, and the retry configs the
+    // client got.
+    ech_offered: bool, ech_seen: bool, ech_confirm: bool, ech_accepted: bool, ech_backend: bool,
+    ech_ctx: bignum::HpkeContext, ech_kdf: u16, ech_aead: u16, ech_config_id: u8, ech_max_name: i64,
+    ech_public_name: u8[..255], ech_enc: u8[..2048], outer_random: u8[32], ech_retry: u8[..8192],
+    th_inner: Transcript,             // the client's inner transcript
+    ch_inner: u8[..8192],             // the client's first ClientHelloInner, until the hash is known
     ch: u8[..8192],                   // the client's first ClientHello, until the hash is known
     inbuf: u8[..16645],               // one record in arrival
     hs: u8[..65536],                  // handshake messages being reassembled
@@ -253,7 +289,10 @@ fn new_conn(is_server: bool, seed: u64) -> Conn {
         group: 0, group2: 0, x25519_sk: [0; 32], ec_sk: [], mlkem_seed: [0; 64], hrr: false, ccs_sent: false, cert_requested: false,
         cr_context: [], cert_scheme: 0, peer_verified: false, peer_schemes: [], alpn: [], sni: [], tickets: 0, key_updates: 0,
         psk_offered: false, resumed: false, psk_dhe: false, peer_not_after: 0, has_session: false, session: no_session(),
-        ch: [], inbuf: [], hs: [], chain: [],
+        ech_offered: false, ech_seen: false, ech_confirm: false, ech_accepted: false, ech_backend: false,
+        ech_ctx: bignum::hpke_empty_context(), ech_kdf: 0, ech_aead: 0, ech_config_id: 0, ech_max_name: 0,
+        ech_public_name: [], ech_enc: [], outer_random: [0; 32], ech_retry: [], th_inner: transcript(256),
+        ch_inner: [], ch: [], inbuf: [], hs: [], chain: [],
     };
     var seed_bytes: u8[32] = [0; 32];
     if seed == 0 {
@@ -318,6 +357,18 @@ fn peer_certificates(c: const Conn&) -> u8[>..] {
 // Whether the peer's certificate was checked against the trusted roots
 // (for a client's, by a server that verifies them).
 fn peer_verified(c: const Conn&) -> bool { c.peer_verified }
+
+// Whether ECH was accepted: the server took the inner ClientHello. A
+// client whose ECH was not accepted fails with ech_required once the
+// handshake with the public name is done; ech_retry_configs then has the
+// configs the server sent for a retry (empty for none).
+fn ech_accepted(c: const Conn&) -> bool { c.ech_accepted }
+
+fn ech_retry_configs(c: const Conn&) -> u8[>..] {
+    var out: u8[>..] = [];
+    out.append(c.ech_retry);
+    return out;
+}
 
 fn failed(c: const Conn&) -> bool { c.state == ST_FAILED }
 fn closed(c: const Conn&) -> bool { c.state == ST_CLOSED }
@@ -384,7 +435,10 @@ fn send_hs(c: Conn&, msg: const u8[:], out: u8[>..]&) {
     if c.write_protected {
         out.append(seal_records(c.write, CT_HANDSHAKE, msg));
     } else {
-        out.append(plain_record(CT_HANDSHAKE, msg, if c.is_server { 0x0303 } else { 0x0301 }));
+        // 0x0301 only on the first ClientHello (§5.1), which does not come
+        // here; a second one after a HelloRetryRequest has 0x0303, as Go
+        // insists.
+        out.append(plain_record(CT_HANDSHAKE, msg, 0x0303));
     }
 }
 
@@ -648,50 +702,17 @@ fn cert_alert(e: i64) -> u8 {
 
 // --- The client -------------------------------------------------------------
 
-fn build_client_hello(c: Conn&, cfg: const ClientConfig&, share_group: u16, cookie: const u8[:]) -> u8[>..] {
+// The client's key_share list: a share for `share_group`, and beside a
+// hybrid a share of its ECDH part with the same key (as Go sends), for
+// servers without ML-KEM; not after a HelloRetryRequest, which allows only
+// the share it asked for.
+fn client_shares(c: Conn&, cfg: const ClientConfig&, share_group: u16) -> u8[>..] {
     var b: u8[>..] = [];
-    put_u16(b, 0x0303);
-    b.append(c.random);
-    b.push(c.session_id.len as! u8);
-    b.append(c.session_id);
-    let suites = begin_vec(b, 2);
-    for s in cfg.suites { put_u16(b, s); }
-    patch_len(b, suites, 2);
-    b.push(1);
-    b.push(0);
-    let exts = begin_vec(b, 2);
-    if cfg.server_name.len > 0 {
-        let e = begin_ext(b, EXT_SERVER_NAME);
-        let list = begin_vec(b, 2);
-        b.push(0);
-        put_u16(b, cfg.server_name.len as! u16);
-        b.append(cfg.server_name);
-        patch_len(b, list, 2);
-        patch_len(b, e, 2);
-    }
-    let sv = begin_ext(b, EXT_SUPPORTED_VERSIONS);
-    b.push(2);
-    put_u16(b, 0x0304);
-    patch_len(b, sv, 2);
-    let sg = begin_ext(b, EXT_SUPPORTED_GROUPS);
-    let gl = begin_vec(b, 2);
-    for g in cfg.groups { put_u16(b, g); }
-    patch_len(b, gl, 2);
-    patch_len(b, sg, 2);
-    let sa = begin_ext(b, EXT_SIGNATURE_ALGORITHMS);
-    let sl = begin_vec(b, 2);
-    for s in SIG_SCHEMES { put_u16(b, s); }
-    patch_len(b, sl, 2);
-    patch_len(b, sa, 2);
-    let ks = begin_ext(b, EXT_KEY_SHARE);
     let kl = begin_vec(b, 2);
     put_u16(b, share_group);
     let pubkey = make_share(c, share_group);
     put_u16(b, pubkey.len as! u16);
     b.append(pubkey);
-    // Beside a hybrid, a share of its ECDH part with the same key (as Go
-    // sends), for servers without ML-KEM. Not after a HelloRetryRequest,
-    // which allows only the share it asked for.
     c.group2 = 0;
     let fallback = ecdh_part(share_group);
     if !c.hrr && mlkem_k(share_group) > 0 && fallback != 0 {
@@ -706,55 +727,181 @@ fn build_client_hello(c: Conn&, cfg: const ClientConfig&, share_group: u16, cook
         }
     }
     patch_len(b, kl, 2);
-    patch_len(b, ks, 2);
-    if cfg.alpn.len > 0 {
-        let a = begin_ext(b, EXT_ALPN);
-        put_u16(b, cfg.alpn.len as! u16);
-        b.append(cfg.alpn);
-        patch_len(b, a, 2);
-    }
-    if cookie.len > 0 {
-        let ck = begin_ext(b, EXT_COOKIE);
-        put_u16(b, cookie.len as! u16);
-        b.append(cookie);
-        patch_len(b, ck, 2);
-    }
-    // psk_key_exchange_modes always, without which servers send no
-    // tickets (§4.2.9).
-    let pm = begin_ext(b, EXT_PSK_KEY_EXCHANGE_MODES);
+    return b;
+}
+
+// A ClientHello naming `sni`, with `random`, `sid`, the key_share list
+// `shares` and a cookie. `ech` is the encrypted_client_hello extension's
+// data (none when empty). Encoded, the extensions from supported_versions
+// to psk_key_exchange_modes become one ech_outer_extensions naming them
+// (EncodedClientHelloInner, §5.1); they follow sni and
+// encrypted_client_hello so that the outer ClientHello has them in that
+// order. With `psk`, pre_shared_key offers the session, its binder zero.
+fn hello_message(c: const Conn&, cfg: const ClientConfig&, sni: const u8[:], random: const u8[:], sid: const u8[:],
+                 shares: const u8[:], cookie: const u8[:], ech: const u8[:], encoded: bool, psk: bool) -> u8[>..] {
+    var b: u8[>..] = [];
+    put_u16(b, 0x0303);
+    b.append(random);
+    b.push(sid.len as! u8);
+    b.append(sid);
+    let suites = begin_vec(b, 2);
+    for s in cfg.suites { put_u16(b, s); }
+    patch_len(b, suites, 2);
     b.push(1);
-    b.push(PSK_DHE_KE);
-    patch_len(b, pm, 2);
-    if !c.psk_offered {
-        patch_len(b, exts, 2);
-        return handshake_message(HS_CLIENT_HELLO, b);
+    b.push(0);
+    let exts = begin_vec(b, 2);
+    if sni.len > 0 {
+        let e = begin_ext(b, EXT_SERVER_NAME);
+        let list = begin_vec(b, 2);
+        b.push(0);
+        put_u16(b, sni.len as! u16);
+        b.append(sni);
+        patch_len(b, list, 2);
+        patch_len(b, e, 2);
     }
-    // The session as a PSK: pre_shared_key, which must come last, its
-    // binder a placeholder until the rest is hashed (§4.2.11.2).
-    let sess = cfg.session;
-    let st, oks = suite(sess.suite);
-    let hl = hash_len(st);
-    let pk = begin_ext(b, EXT_PRE_SHARED_KEY);
-    let ids = begin_vec(b, 2);
-    put_u16(b, sess.ticket.len as! u16);
-    b.append(sess.ticket);
-    let age = obfuscated_age(sess, now_ms(cfg.now));
-    for i in 4 { b.push((age >> (8 * (3 - i))) as! u8); }
-    patch_len(b, ids, 2);
-    put_u16(b, (hl + 1) as! u16);
-    b.push(hl as! u8);
-    for i in hl { b.push(0); }
-    patch_len(b, pk, 2);
+    if ech.len > 0 {
+        let e = begin_ext(b, EXT_ENCRYPTED_CLIENT_HELLO);
+        b.append(ech);
+        patch_len(b, e, 2);
+    }
+    if encoded {
+        let oe = begin_ext(b, EXT_ECH_OUTER_EXTENSIONS);
+        let ol = begin_vec(b, 1);
+        put_u16(b, EXT_SUPPORTED_VERSIONS);
+        put_u16(b, EXT_SUPPORTED_GROUPS);
+        put_u16(b, EXT_SIGNATURE_ALGORITHMS);
+        put_u16(b, EXT_KEY_SHARE);
+        if cfg.alpn.len > 0 { put_u16(b, EXT_ALPN); }
+        if cookie.len > 0 { put_u16(b, EXT_COOKIE); }
+        put_u16(b, EXT_PSK_KEY_EXCHANGE_MODES);
+        patch_len(b, ol, 1);
+        patch_len(b, oe, 2);
+    } else {
+        let sv = begin_ext(b, EXT_SUPPORTED_VERSIONS);
+        b.push(2);
+        put_u16(b, 0x0304);
+        patch_len(b, sv, 2);
+        let sg = begin_ext(b, EXT_SUPPORTED_GROUPS);
+        let gl = begin_vec(b, 2);
+        for g in cfg.groups { put_u16(b, g); }
+        patch_len(b, gl, 2);
+        patch_len(b, sg, 2);
+        let sa = begin_ext(b, EXT_SIGNATURE_ALGORITHMS);
+        let sl = begin_vec(b, 2);
+        for s in SIG_SCHEMES { put_u16(b, s); }
+        patch_len(b, sl, 2);
+        patch_len(b, sa, 2);
+        let ks = begin_ext(b, EXT_KEY_SHARE);
+        b.append(shares);
+        patch_len(b, ks, 2);
+        if cfg.alpn.len > 0 {
+            let a = begin_ext(b, EXT_ALPN);
+            put_u16(b, cfg.alpn.len as! u16);
+            b.append(cfg.alpn);
+            patch_len(b, a, 2);
+        }
+        if cookie.len > 0 {
+            let ck = begin_ext(b, EXT_COOKIE);
+            put_u16(b, cookie.len as! u16);
+            b.append(cookie);
+            patch_len(b, ck, 2);
+        }
+        // psk_key_exchange_modes always, without which servers send no
+        // tickets (§4.2.9).
+        let pm = begin_ext(b, EXT_PSK_KEY_EXCHANGE_MODES);
+        b.push(1);
+        b.push(PSK_DHE_KE);
+        patch_len(b, pm, 2);
+    }
+    if psk {
+        // The session as a PSK: pre_shared_key, which must come last, its
+        // binder a placeholder until the rest is hashed (§4.2.11.2).
+        let sess = cfg.session;
+        let st, oks = suite(sess.suite);
+        let hl = hash_len(st);
+        let pk = begin_ext(b, EXT_PRE_SHARED_KEY);
+        let ids = begin_vec(b, 2);
+        put_u16(b, sess.ticket.len as! u16);
+        b.append(sess.ticket);
+        let age = obfuscated_age(sess, now_ms(cfg.now));
+        for i in 4 { b.push((age >> (8 * (3 - i))) as! u8); }
+        patch_len(b, ids, 2);
+        put_u16(b, (hl + 1) as! u16);
+        b.push(hl as! u8);
+        for i in hl { b.push(0); }
+        patch_len(b, pk, 2);
+    }
     patch_len(b, exts, 2);
-    var msg = handshake_message(HS_CLIENT_HELLO, b);
-    // The binder: over the transcript so far (after a HelloRetryRequest)
-    // and this ClientHello up to its binders.
-    var th = if c.hrr { c.th } else { transcript(st.hash) };
+    return handshake_message(HS_CLIENT_HELLO, b);
+}
+
+// The binder of a ClientHello that offers the session: over the
+// transcript so far (`prior`, after a HelloRetryRequest) and the
+// ClientHello up to its binders.
+fn set_binder(c: const Conn&, cfg: const ClientConfig&, msg: u8[>..]&, prior: const Transcript&) {
+    let st, oks = suite(cfg.session.suite);
+    let hl = hash_len(st);
+    var th = if c.hrr { prior } else { transcript(st.hash) };
     transcript_add(th, msg[..msg.len - 3 - hl]);
-    let early = schedule(st.hash, sess.psk);
+    let early = schedule(st.hash, cfg.session.psk);
     let binder = finished_data(st.hash, binder_key(early, false), transcript_hash(th));
     for i in hl { msg[msg.len - hl + i] = binder[i]; }
-    return msg;
+}
+
+// The outer encrypted_client_hello extension's data (§5).
+fn ech_outer_ext(c: const Conn&, enc: const u8[:], payload: const u8[:]) -> u8[>..] {
+    var b: u8[>..] = [];
+    b.push(ECH_OUTER);
+    put_u16(b, c.ech_kdf);
+    put_u16(b, c.ech_aead);
+    b.push(c.ech_config_id);
+    put_u16(b, enc.len as! u16);
+    b.append(enc);
+    put_u16(b, payload.len as! u16);
+    b.append(payload);
+    return b;
+}
+
+// The ClientHello to send, and with ECH the ClientHelloInner it carries
+// (for the inner transcript; empty without ECH). With ECH the one sent is
+// the outer one: the config's public name, its own random, the same key
+// shares and no PSK, and the inner one encoded, padded and sealed under
+// the config's key with the outer one as AAD (§6.1). A second ClientHello
+// seals with the same HPKE context and an empty enc (§6.1.5).
+fn build_client_hello(c: Conn&, cfg: const ClientConfig&, share_group: u16, cookie: const u8[:]) -> u8[>..], u8[>..] {
+    let shares = client_shares(c, cfg, share_group);
+    if !c.ech_offered {
+        var msg = hello_message(c, cfg, cfg.server_name, c.random, c.session_id, shares, cookie, "", false, c.psk_offered);
+        if c.psk_offered { set_binder(c, cfg, msg, c.th); }
+        var none: u8[>..] = [];
+        return msg, none;
+    }
+    let inner_ext: u8[1] = [ECH_INNER];
+    var inner = hello_message(c, cfg, cfg.server_name, c.random, c.session_id, shares, cookie, inner_ext, false,
+                              c.psk_offered);
+    if c.psk_offered { set_binder(c, cfg, inner, c.th_inner); }
+    var enc_msg = hello_message(c, cfg, cfg.server_name, c.random, "", shares, cookie, inner_ext, true, c.psk_offered);
+    if c.psk_offered {
+        let st, oks = suite(cfg.session.suite);
+        let hl = hash_len(st);
+        for i in hl { enc_msg[enc_msg.len - hl + i] = inner[inner.len - hl + i]; }
+    }
+    var encoded: u8[>..] = [];
+    encoded.append(enc_msg[4..]);
+    let npad = ech_padding(encoded.len, cfg.server_name.len, c.ech_max_name);
+    for i in npad { encoded.push(0); }
+    let enc: u8[>..] = if c.hrr { "" } else { c.ech_enc[..] };
+    var zeros: u8[>..] = [];
+    zeros.resize(encoded.len + 16, 0);
+    let ext0 = ech_outer_ext(c, enc, zeros);
+    let outer0 = hello_message(c, cfg, c.ech_public_name, c.outer_random, c.session_id, shares, cookie, ext0, false,
+                               false);
+    let payload, ok = bignum::hpke_seal(c.ech_ctx, outer0[4..], encoded);
+    assert(ok && payload.len == zeros.len);
+    let ext = ech_outer_ext(c, enc, payload);
+    let outer = hello_message(c, cfg, c.ech_public_name, c.outer_random, c.session_id, shares, cookie, ext, false,
+                              false);
+    return outer, inner;
 }
 
 // Sends the ClientHello.
@@ -774,8 +921,36 @@ fn client_start(c: Conn&, cfg: const ClientConfig&, out: u8[>..]&) {
             if oks && ok2 && s2.hash == st.hash { c.psk_offered = true; }
         }
     }
-    let ch = build_client_hello(c, cfg, cfg.groups[0], "");
+    // ECH: the first usable config, and an HPKE context for it.
+    if cfg.ech_config_list.len > 0 {
+        let ec, okc = pick_ech_config(cfg.ech_config_list);
+        var enc: u8[>..] = [];
+        var ctx = bignum::hpke_empty_context();
+        var oks = false;
+        if okc {
+            let e, x, ok = bignum::hpke_sender(ec.kem, ec.kdf, ec.aead, ec.public_key, ech_info(ec.raw));
+            enc = copy(e);
+            ctx = copy(x);
+            oks = ok;
+        }
+        if !okc || !oks || enc.len > c.ech_enc.cap {
+            c.alert = ALERT_INTERNAL_ERROR;
+            c.state = ST_FAILED;
+            return;
+        }
+        c.ech_offered = true;
+        c.ech_ctx = ctx;
+        c.ech_enc.append(enc);
+        c.ech_kdf = ec.kdf as! u16;
+        c.ech_aead = ec.aead as! u16;
+        c.ech_config_id = ec.config_id;
+        c.ech_max_name = ec.max_name_len;
+        c.ech_public_name.append(ec.public_name);
+        drbg_fill(c, c.outer_random);
+    }
+    let ch, inner = build_client_hello(c, cfg, cfg.groups[0], "");
     c.ch.append(ch);
+    c.ch_inner.append(inner);
     out.append(plain_record(CT_HANDSHAKE, ch, 0x0301));
     c.state = ST_WAIT_SH;
 }
@@ -802,6 +977,8 @@ fn client_server_hello(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: 
     var share = Rd { pos: 0, end: 0, bad: false };
     var cookie = Rd { pos: 0, end: 0, bad: false };
     var psk_selected = -1;
+    var ech_hrr = empty_rd();
+    var has_ech_hrr = false;
     while exts.pos < exts.end {
         let ty = get_u16(exts, m);
         var e = get_vec(exts, m, 2);
@@ -815,6 +992,9 @@ fn client_server_hello(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: 
             cookie = get_vec(e, m, 2);
         } else if ty == EXT_PRE_SHARED_KEY && !is_hrr && c.psk_offered {
             psk_selected = get_u16(e, m);
+        } else if ty == EXT_ENCRYPTED_CLIENT_HELLO && is_hrr && c.ech_offered {
+            ech_hrr = get_bytes(e, 8);
+            has_ech_hrr = true;
         } else {
             return fail(c, ALERT_UNSUPPORTED_EXTENSION, out);
         }
@@ -840,11 +1020,29 @@ fn client_server_hello(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: 
         transcript_add(c.th, c.ch);
         transcript_restart_hrr(c.th);
         transcript_add(c.th, m);
+        // ECH: accepted if the HelloRetryRequest confirms it (§7.2.1), over
+        // the inner transcript with the confirmation zeroed.
+        if c.ech_offered {
+            c.th_inner = transcript(s.hash);
+            transcript_add(c.th_inner, c.ch_inner);
+            transcript_restart_hrr(c.th_inner);
+            if has_ech_hrr {
+                var zeroed: u8[>..] = [];
+                zeroed.append(m);
+                for i in 8 { zeroed[ech_hrr.pos + i] = 0; }
+                var t = c.th_inner;
+                transcript_add(t, zeroed);
+                let conf = ech_confirmation(s.hash, c.random, "hrr ech accept confirmation", transcript_hash(t));
+                c.ech_accepted = conf[..] == m[ech_hrr.pos..ech_hrr.end];
+            }
+            transcript_add(c.th_inner, m);
+        }
         send_ccs(c, out);
         var ck: u8[>..] = [];
         ck.append(m[cookie.pos..cookie.end]);
-        let ch2 = build_client_hello(c, cfg, share_group as! u16, ck);
+        let ch2, inner2 = build_client_hello(c, cfg, share_group as! u16, ck);
         send_hs(c, ch2, out);
+        if c.ech_offered { transcript_add(c.th_inner, inner2); }
         return 0;
     }
     if c.group2 != 0 && share_group == c.group2 { c.group = c.group2; }
@@ -855,13 +1053,32 @@ fn client_server_hello(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: 
         c.suite = s;
         c.th = transcript(s.hash);
         transcript_add(c.th, c.ch);
+        if c.ech_offered {
+            c.th_inner = transcript(s.hash);
+            transcript_add(c.th_inner, c.ch_inner);
+        }
+    }
+    // ECH: accepted if the ServerHello's random ends in the confirmation
+    // (§7.2), over the inner transcript with those bytes zeroed; then the
+    // inner ClientHello is the one in the transcript.
+    if c.ech_offered {
+        var zeroed: u8[>..] = [];
+        zeroed.append(m);
+        for i in 8 { zeroed[30 + i] = 0; }
+        var t = c.th_inner;
+        transcript_add(t, zeroed);
+        let conf = ech_confirmation(s.hash, c.random, "ech accept confirmation", transcript_hash(t));
+        c.ech_accepted = conf[..] == m[30..38];
+        if c.ech_accepted { c.th = c.th_inner; }
     }
     transcript_add(c.th, m);
-    // The PSK, if the server took it: the one identity offered, under a
-    // suite of the session's hash.
+    // The PSK, if the server took it: the one identity offered (in the
+    // inner ClientHello with ECH), under a suite of the session's hash.
     if psk_selected >= 0 {
         let st, okst = suite(cfg.session.suite);
-        if psk_selected != 0 || st.hash != s.hash { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
+        if psk_selected != 0 || st.hash != s.hash || (c.ech_offered && !c.ech_accepted) {
+            return fail(c, ALERT_ILLEGAL_PARAMETER, out);
+        }
         c.resumed = true;
         c.peer_not_after = cfg.session.not_after;
     }
@@ -898,6 +1115,13 @@ fn client_encrypted_extensions(c: Conn&, cfg: const ClientConfig&, m: const u8[:
             if !found { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
             c.alpn.clear();
             c.alpn.append(m[p.pos..p.end]);
+        } else if ty == EXT_ENCRYPTED_CLIENT_HELLO && c.ech_offered {
+            // Retry configs, only when ECH was not accepted (§7.1).
+            if c.ech_accepted { return fail(c, ALERT_UNSUPPORTED_EXTENSION, out); }
+            if e.end - e.pos <= c.ech_retry.cap {
+                c.ech_retry.clear();
+                c.ech_retry.append(m[e.pos..e.end]);
+            }
         } else if ty == EXT_KEY_SHARE || ty == EXT_SUPPORTED_VERSIONS || ty == EXT_COOKIE || ty == EXT_SIGNATURE_ALGORITHMS {
             return fail(c, ALERT_ILLEGAL_PARAMETER, out);     // forbidden in EncryptedExtensions
         }
@@ -936,12 +1160,16 @@ fn client_certificate(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u
     if !okt { return fail(c, ALERT_BAD_CERTIFICATE, out); }
     if cfg.verify {
         let now = if cfg.now != 0 { cfg.now } else { time() as i64 };
+        // ECH not accepted, the certificate must be for the public name
+        // (§6.1.7).
+        var name: u8[>..] = [];
+        name.append(if c.ech_offered && !c.ech_accepted { c.ech_public_name[..] } else { cfg.server_name[..] });
         var e = x509::OK;
         if cfg.system_roots {
-            let es, found = x509::verify_with_system_roots(c.chain[..ct.end], c.chain[ct.end..], now, cfg.server_name);
+            let es, found = x509::verify_with_system_roots(c.chain[..ct.end], c.chain[ct.end..], now, name);
             e = es;
         } else {
-            e = x509::verify_with_roots(c.chain[..ct.end], c.chain[ct.end..], cfg.roots, now, cfg.server_name);
+            e = x509::verify_with_roots(c.chain[..ct.end], c.chain[ct.end..], cfg.roots, now, name);
         }
         if e != x509::OK {
             c.error = e;
@@ -1015,6 +1243,7 @@ fn client_certificate_request(c: Conn&, cfg: const ClientConfig&, m: const u8[:]
         let sch = pick_scheme(cfg.cert_key, schemes);
         if sch != 0 && (!has_cas || issued_by_one_of(cfg.cert_chain, m, cas)) { c.cert_scheme = sch; }
     }
+    if c.ech_offered && !c.ech_accepted { c.cert_scheme = 0; }    // none for the public name
     transcript_add(c.th, m);
     c.state = ST_WAIT_CERT;
     return 0;
@@ -1105,6 +1334,9 @@ fn client_finished(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8[>
     c.write = record_keys(c.suite, c.sch.c_ap);
     c.read = record_keys(c.suite, c.sch.s_ap);
     c.state = ST_CONNECTED;
+    // ECH not accepted: the handshake with the public name only served to
+    // authenticate the retry configs (§6.1.6).
+    if c.ech_offered && !c.ech_accepted { return fail(c, ALERT_ECH_REQUIRED, out); }
     return 0;
 }
 
@@ -1256,8 +1488,12 @@ fn in_u16_list(m: const u8[:], list: Rd, v: u16) -> bool {
     return false;
 }
 
+// A ServerHello or HelloRetryRequest. With ECH confirmed, `inner_random`
+// is the inner ClientHello's: the confirmation goes in the last 8 bytes of
+// a ServerHello's random, or in a HelloRetryRequest's
+// encrypted_client_hello (§7.2).
 fn send_server_hello(c: Conn&, random: const u8[:], share: const u8[:], hrr: bool, out: u8[>..]&,
-                     psk_identity: i64 = -1) {
+                     psk_identity: i64 = -1, inner_random: const u8[:] = "") {
     var b: u8[>..] = [];
     put_u16(b, 0x0303);
     b.append(random);
@@ -1281,8 +1517,119 @@ fn send_server_hello(c: Conn&, random: const u8[:], share: const u8[:], hrr: boo
         put_u16(b, psk_identity as! u16);
         patch_len(b, pk, 2);
     }
+    if hrr && inner_random.len > 0 {
+        let ee = begin_ext(b, EXT_ENCRYPTED_CLIENT_HELLO);
+        for i in 8 { b.push(0); }
+        patch_len(b, ee, 2);
+    }
     patch_len(b, exts, 2);
-    send_hs(c, handshake_message(HS_SERVER_HELLO, b), out);
+    var msg = handshake_message(HS_SERVER_HELLO, b);
+    if inner_random.len > 0 {
+        let at = if hrr { msg.len - 8 } else { 30 };
+        for i in 8 { msg[at + i] = 0; }
+        var th = c.th;
+        transcript_add(th, msg);
+        let label: const u8[:] = if hrr { "hrr ech accept confirmation" } else { "ech accept confirmation" };
+        let conf = ech_confirmation(c.suite.hash, inner_random, label, transcript_hash(th));
+        for i in 8 { msg[at + i] = conf[i]; }
+    }
+    send_hs(c, msg, out);
+}
+
+// ECH on the server (§7.1), before anything else looks at a ClientHello:
+// the ClientHello to go on with. An outer one is decrypted with each ECH
+// key in turn, the first that opens it giving the inner one; with none,
+// the outer one goes on (and the client may get retry configs). A second
+// ClientHello after one that was accepted must carry the inner one under
+// the same HPKE context. An inner one (from a client-facing server, to a
+// backend) is confirmed as it is. -1 after failing.
+fn server_ech(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: u8[>..]&) -> u8[>..], i64 {
+    var same: u8[>..] = [];
+    same.append(m);
+    let second = c.state == ST_WAIT_CH2;
+    var exts, okx = ech_hello_extensions(m);
+    if !okx { return same, 0; }
+    var ext = EchRd { pos: 0, end: 0, bad: true };
+    var found = false;
+    while exts.pos < exts.end {
+        let ty = ech_u16(exts, m);
+        let d = ech_vec(exts, m, 2);
+        if exts.bad { return same, 0; }
+        if ty == EXT_ENCRYPTED_CLIENT_HELLO { ext = d; found = true; }
+    }
+    if second && c.ech_confirm && !found { return same, fail(c, ALERT_MISSING_EXTENSION, out); }
+    if !found || (second && !c.ech_confirm) { return same, 0; }
+    var r = ext;
+    let kind = ech_u8(r, m);
+    if r.bad { return same, fail(c, ALERT_DECODE_ERROR, out); }
+    if kind == ECH_INNER {
+        if r.pos != r.end || (second && !c.ech_backend) { return same, fail(c, ALERT_DECODE_ERROR, out); }
+        c.ech_backend = true;
+        c.ech_confirm = true;
+        return same, 0;
+    }
+    if kind != ECH_OUTER { return same, fail(c, ALERT_ILLEGAL_PARAMETER, out); }
+    let kdf = ech_u16(r, m);
+    let aead = ech_u16(r, m);
+    let id = ech_u8(r, m);
+    let enc = ech_vec(r, m, 2);
+    let payload = ech_vec(r, m, 2);
+    if r.bad || r.pos != r.end { return same, fail(c, ALERT_DECODE_ERROR, out); }
+    let aad = ech_aad(m, payload.pos, payload.end);
+    if second {
+        if c.ech_backend { return same, fail(c, ALERT_DECODE_ERROR, out); }
+        if kdf != c.ech_kdf || aead != c.ech_aead || id != c.ech_config_id || enc.end != enc.pos {
+            return same, fail(c, ALERT_ILLEGAL_PARAMETER, out);
+        }
+        let pt, oko = bignum::hpke_open(c.ech_ctx, aad, m[payload.pos..payload.end]);
+        if !oko { return same, fail(c, ALERT_DECRYPT_ERROR, out); }
+        let inner, okd = ech_decode_inner(m, pt);
+        if !okd || !ech_inner_ok(inner) { return same, fail(c, ALERT_ILLEGAL_PARAMETER, out); }
+        return inner, 0;
+    }
+    c.ech_seen = true;
+    if !ech_kdf_ok(kdf) || !ech_aead_ok(aead) { return same, 0; }
+    var k = EchRd { pos: 0, end: cfg.ech_keys.len, bad: false };
+    while k.pos < k.end {
+        let config = ech_vec(k, cfg.ech_keys, 2);
+        let sk = ech_vec(k, cfg.ech_keys, 2);
+        let retry = ech_u8(k, cfg.ech_keys);
+        if k.bad { break; }
+        let kem, cid, okc = ech_server_config(cfg.ech_keys[config.pos..config.end]);
+        if !okc { continue; }
+        var ctx, okr = bignum::hpke_recipient(kem, kdf, aead, cfg.ech_keys[sk.pos..sk.end], m[enc.pos..enc.end],
+                                              ech_info(cfg.ech_keys[config.pos..config.end]));
+        if !okr { continue; }
+        let pt, oko = bignum::hpke_open(ctx, aad, m[payload.pos..payload.end]);
+        if !oko { continue; }
+        let inner, okd = ech_decode_inner(m, pt);
+        if !okd || !ech_inner_ok(inner) { return same, fail(c, ALERT_ILLEGAL_PARAMETER, out); }
+        c.ech_confirm = true;
+        c.ech_accepted = true;
+        c.ech_ctx = ctx;
+        c.ech_kdf = kdf as! u16;
+        c.ech_aead = aead as! u16;
+        c.ech_config_id = id as! u8;
+        return inner, 0;
+    }
+    return same, 0;
+}
+
+// The retry configs (an ECHConfigList) of the keys sent as retry; empty
+// for none.
+fn ech_retry_list(cfg: const ServerConfig&) -> u8[>..] {
+    var configs: u8[>..] = [];
+    var k = EchRd { pos: 0, end: cfg.ech_keys.len, bad: false };
+    while k.pos < k.end {
+        let config = ech_vec(k, cfg.ech_keys, 2);
+        let sk = ech_vec(k, cfg.ech_keys, 2);
+        let retry = ech_u8(k, cfg.ech_keys);
+        if k.bad { break; }
+        if retry == 1 { configs.append(cfg.ech_keys[config.pos..config.end]); }
+    }
+    var none: u8[>..] = [];
+    if configs.len == 0 { return none; }
+    return ech_config_list(configs);
 }
 
 fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: u8[>..]&) -> i64 {
@@ -1320,7 +1667,8 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
         c.th = transcript(s.hash);
         transcript_add(c.th, m);
         transcript_restart_hrr(c.th);
-        send_server_hello(c, HRR_RANDOM, "", true, out);
+        if c.ech_confirm { send_server_hello(c, HRR_RANDOM, "", true, out, -1, m[h.random.pos..h.random.end]); }
+        else { send_server_hello(c, HRR_RANDOM, "", true, out); }
         if c.session_id.len > 0 { send_ccs(c, out); }
         c.hrr = true;
         c.state = ST_WAIT_CH2;
@@ -1402,7 +1750,8 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
     let mine, shared, okx = server_share(c, group, m[share.pos..share.end]);
     if !okx { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
     drbg_fill(c, c.random);
-    send_server_hello(c, c.random, mine, false, out, psk_identity);
+    if c.ech_confirm { send_server_hello(c, c.random, mine, false, out, psk_identity, m[h.random.pos..h.random.end]); }
+    else { send_server_hello(c, c.random, mine, false, out, psk_identity); }
     if c.session_id.len > 0 { send_ccs(c, out); }
     c.sch = schedule(s.hash, psk);
     schedule_handshake(c.sch, shared, transcript_hash(c.th));
@@ -1420,6 +1769,15 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
         ee.append(c.alpn);
         patch_len(ee, l, 2);
         patch_len(ee, a, 2);
+    }
+    // ECH offered and not accepted: the retry configs, if any (§7.1).
+    if c.ech_seen && !c.ech_confirm {
+        let retry = ech_retry_list(cfg);
+        if retry.len > 0 {
+            let e = begin_ext(ee, EXT_ENCRYPTED_CLIENT_HELLO);
+            ee.append(retry);
+            patch_len(ee, e, 2);
+        }
     }
     patch_len(ee, exts, 2);
     send_hs(c, handshake_message(HS_ENCRYPTED_EXTENSIONS, ee), out);
@@ -1569,7 +1927,9 @@ fn send_session_ticket(c: Conn&, cfg: const ServerConfig&, out: u8[>..]&) -> boo
 fn server_message(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: u8[>..]&) -> i64 {
     let t = m[0];
     if (c.state == ST_WAIT_CH || c.state == ST_WAIT_CH2) && t == HS_CLIENT_HELLO {
-        let r = server_client_hello(c, cfg, m, out);
+        let ch, re = server_ech(c, cfg, m, out);
+        if re != 0 { return re; }
+        let r = server_client_hello(c, cfg, ch, out);
         if r == 0 && c.hs.len != 0 { return fail(c, ALERT_UNEXPECTED_MESSAGE, out); }
         return r;
     }
@@ -1712,13 +2072,14 @@ fn feed(c: Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&, input: c
 
 fn no_server() -> ServerConfig {
     ServerConfig { key: x509::empty_key(), groups: [], suites: [], alpn: [], seed: 0, now: 0, tickets: 0,
-                   ticket_key: [0; 32], chain: [], client_auth: NO_CLIENT_CERT, client_cas: x509::new_pool() }
+                   ticket_key: [0; 32], chain: [], client_auth: NO_CLIENT_CERT, ech_keys: [],
+                   client_cas: x509::new_pool() }
 }
 
 fn no_client() -> ClientConfig {
     ClientConfig { server_name: [], verify: false, now: 0, groups: [], suites: [], alpn: [], seed: 0,
-                   session: no_session(), cert_key: x509::empty_key(), cert_chain: [], system_roots: false,
-                   roots: x509::new_pool() }
+                   session: no_session(), cert_key: x509::empty_key(), cert_chain: [], ech_config_list: [],
+                   system_roots: false, roots: x509::new_pool() }
 }
 
 fn client_feed(c: Conn&, cfg: const ClientConfig&, input: const u8[:], out: u8[>..]&, app: u8[>..]&) -> i64 {

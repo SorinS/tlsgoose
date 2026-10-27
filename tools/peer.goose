@@ -5,6 +5,10 @@
 //               [--cert chain.pem --key key.pem]
 //   peer server <chain.pem> <key.pem> [--suite ...] [--group ...] [--alpn ...]
 //               [--client-auth 0-4] [--client-cas cas.pem]
+//   peer echkey <kem, hex> <public name>   prints "CONFIG <ECHConfig hex>" and "KEY <private key hex>"
+//
+// --ech <ECHConfigList hex> has the client offer ECH, --ech-key
+// <config hex>:<private key hex> gives the server a key (sent as retry).
 //
 // Commands, one per line: "IN <hex>" (bytes from the network), "SEND
 // <hex>" (application data), "KEYUPDATE", "CLOSE", "SESSION" (the
@@ -12,7 +16,8 @@
 // start and after each command the peer prints "OUT <hex>" if it has bytes
 // to send, "APP <hex>" if it received data, "SESSION <hex|->" when asked,
 // then "STATE <state> <alert> <alpn> <group> <resumed> <peer certificate
-// bytes> <peer verified>" and "END". --session <hex> gives the client a
+// bytes> <peer verified> <ECH accepted>" and "END"; "RETRY <hex>" with
+// the client's retry configs, if it got any. --session <hex> gives the client a
 // session to resume, --ticket-key <hex> the server its ticket key; --cert
 // and --key the client a certificate, --client-auth (tls::NO_CLIENT_CERT
 // ...) and --client-cas the server what it asks of clients.
@@ -55,14 +60,23 @@ fn pem_der(path: const u8[:], label: const u8[:]) -> u8[>..] {
 fn report(c: const tls::Conn&, out: const u8[:], app: const u8[:]) {
     if out.len > 0 { print("OUT ", hex(out)); }
     if app.len > 0 { print("APP ", hex(app)); }
+    if c.ech_retry.len > 0 { print("RETRY ", hex(c.ech_retry)); }
     print("STATE ", c.state, " ", c.alert, " ", if c.alpn.len > 0 { c.alpn[..] } else { "-" }, " ", c.group, " ",
-          if tls::resumed(c) { 1 } else { 0 }, " ", c.chain.len, " ", if tls::peer_verified(c) { 1 } else { 0 });
+          if tls::resumed(c) { 1 } else { 0 }, " ", c.chain.len, " ", if tls::peer_verified(c) { 1 } else { 0 }, " ",
+          if tls::ech_accepted(c) { 1 } else { 0 });
     print("END");
     flush_stdout();
 }
 
 fn main() {
     let a = args();
+    if a[1] == "echkey" {
+        let k = unhex(a[2]);
+        let config, sk = tls::generate_ech_key(1, (k[0] as i64) << 8 | k[1], a[3]);
+        print("CONFIG ", hex(config));
+        print("KEY ", hex(sk));
+        return;
+    }
     let is_server = a[1] == "server";
     var cc = tls::client_config(if is_server { "" } else { a[2] }, "");
     var key_der: u8[>..] = [];
@@ -119,6 +133,11 @@ fn main() {
             sc.client_auth = v;
         } else if a[i] == "--client-cas" {
             let n = x509::pool_add_file(sc.client_cas, a[i + 1]);
+        } else if a[i] == "--ech" {
+            cc.ech_config_list.append(unhex(a[i + 1]));
+        } else if a[i] == "--ech-key" {
+            let parts = split(a[i + 1], ':');
+            if !tls::add_ech_key(sc, unhex(parts[0]), unhex(parts[1]), true) { write_stderr("bad ECH key\n"); assert(false); }
         } else if a[i] == "--now" {
             let v, ok = parse_int(a[i + 1], 10);
             cc.now = v;

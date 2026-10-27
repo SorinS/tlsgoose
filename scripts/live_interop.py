@@ -38,6 +38,7 @@ class Peer:
         self.p = subprocess.Popen([exe, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.state = None
         self.session = None
+        self.retry = None
 
     def read(self):
         out, app = b"", b""
@@ -55,8 +56,11 @@ class Peer:
             elif kind == "SESSION":
                 self.session = None if rest == "-" else rest
             elif kind == "STATE":
-                st, alert, alpn, group, resumed, peer, verified = rest.split()
-                self.state = (int(st), int(alert), alpn, int(group), resumed == "1", int(peer), verified == "1")
+                st, alert, alpn, group, resumed, peer, verified, ech = rest.split()
+                self.state = (int(st), int(alert), alpn, int(group), resumed == "1", int(peer), verified == "1",
+                              ech == "1")
+            elif kind == "RETRY":
+                self.retry = rest
 
     def cmd(self, line):
         self.p.stdin.write(line + "\n")

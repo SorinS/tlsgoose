@@ -6,16 +6,25 @@
 //	gointerop client <port> <roots.pem> <n> [cert.pem key.pem]
 //	    n connections sharing a session cache, with a client certificate if given; prints whether
 //	    each one resumed, its group and the server's reply
+//	gointerop ech-server <cert.pem> <key.pem> <port> <config hex> <private key hex>
+//	    TLS 1.3 server with that ECH key (sent as retry); echoes one line per connection, with
+//	    whether ECH was accepted and the server name it saw
+//	gointerop ech-client <port> <roots.pem> <server name> <ECHConfigList hex> [groups]
+//	    one connection offering ECH; prints whether it was accepted and the reply, or the
+//	    rejection's retry configs; groups (comma-separated ids, hex) set CurvePreferences
 package main
 
 import (
 	"bufio"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"strconv"
+	"strings"
 )
 
 func main() {
@@ -59,6 +68,68 @@ func main() {
 				fmt.Fprintf(c, "echo %s resumed=%v client=%s", line[:len(line)-1], st.DidResume, client)
 			}(c)
 		}
+	case "ech-server":
+		cert, err := tls.LoadX509KeyPair(os.Args[2], os.Args[3])
+		if err != nil {
+			panic(err)
+		}
+		config, _ := hex.DecodeString(os.Args[5])
+		sk, _ := hex.DecodeString(os.Args[6])
+		cfg := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13,
+			EncryptedClientHelloKeys: []tls.EncryptedClientHelloKey{{Config: config, PrivateKey: sk, SendAsRetry: true}}}
+		ln, err := tls.Listen("tcp", "127.0.0.1:"+os.Args[4], cfg)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Println("ready")
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				panic(err)
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				line, err := bufio.NewReader(c).ReadString('\n')
+				if err != nil {
+					fmt.Println("server error", err)
+					return
+				}
+				st := c.(*tls.Conn).ConnectionState()
+				fmt.Fprintf(c, "echo %s ech=%v sni=%s", line[:len(line)-1], st.ECHAccepted, st.ServerName)
+			}(c)
+		}
+	case "ech-client":
+		pem, err := os.ReadFile(os.Args[3])
+		if err != nil {
+			panic(err)
+		}
+		roots := x509.NewCertPool()
+		roots.AppendCertsFromPEM(pem)
+		list, _ := hex.DecodeString(os.Args[5])
+		cfg := &tls.Config{RootCAs: roots, ServerName: os.Args[4], MinVersion: tls.VersionTLS13,
+			EncryptedClientHelloConfigList: list}
+		if len(os.Args) > 6 {
+			for _, g := range strings.Split(os.Args[6], ",") {
+				v, _ := strconv.ParseUint(g, 16, 16)
+				cfg.CurvePreferences = append(cfg.CurvePreferences, tls.CurveID(v))
+			}
+		}
+		c, err := tls.Dial("tcp", "127.0.0.1:"+os.Args[2], cfg)
+		var rej *tls.ECHRejectionError
+		if errors.As(err, &rej) {
+			fmt.Printf("rejected retry=%x\n", rej.RetryConfigList)
+			return
+		}
+		if err != nil {
+			fmt.Println("error", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(c, "hello\n")
+		buf := make([]byte, 100)
+		k, _ := c.Read(buf)
+		st := c.ConnectionState()
+		fmt.Printf("ech=%v reply=%q\n", st.ECHAccepted, buf[:k])
+		c.Close()
 	case "client":
 		pem, err := os.ReadFile(os.Args[3])
 		if err != nil {
