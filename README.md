@@ -325,7 +325,7 @@ python3 scripts/go_interop.py           # live, against Go's crypto/tls (below)
 python3 scripts/gen_handshake.py        # remake vectors/hs_certs.txt
 python3 scripts/openssl_interop.py      # recapture vectors of OpenSSL's connections
 python3 scripts/rfc8448.py              # re-extract RFC 8448's trace (fetches the RFC)
-tools/gointerop.sh <mode> ...           # Go's side by hand (modes in tools/gointerop/main.go)
+tools/gointerop.sh <mode> -flags ...    # Go's side by hand (gointerop.sh <mode> -h lists the flags)
 ```
 
 They take the compiler from `--goose`, `$GOOSE`, `goose` on PATH or

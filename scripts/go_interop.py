@@ -55,21 +55,22 @@ def relay_until(peer, sock, done):
     return app
 
 
-def go_env(tls12):
-    """The Go side's environment for a TLS 1.2 case: (mode, suites) or None."""
-    env = dict(os.environ)
+def go_flags(tls12):
+    """The Go side's flags for a TLS 1.2 case: (mode, suites) or None."""
+    flags = []
     if tls12:
-        env["GOINTEROP_TLS12"] = tls12[0]
+        flags += ["-tls12", tls12[0]]
         if tls12[1]:
-            env["GOINTEROP_SUITES"] = tls12[1]
-    return env
+            flags += ["-suites", tls12[1]]
+    return flags
 
 
 def goose_client_go_server(exe, gobin, client_cert=False, cert="p256", tls12=None, goose_args=(), want_tail=""):
     port = free_port()
-    extra = [os.path.join(VEC, "hs_clientca.pem")] if client_cert else []
-    srv = subprocess.Popen([gobin, "server", os.path.join(VEC, f"hs_{cert}.pem"), os.path.join(VEC, f"hs_{cert}.key"),
-                            str(port), *extra], stdout=subprocess.PIPE, text=True, env=go_env(tls12))
+    extra = ["-client-cas", os.path.join(VEC, "hs_clientca.pem")] if client_cert else []
+    srv = subprocess.Popen([gobin, "server", "-cert", os.path.join(VEC, f"hs_{cert}.pem"),
+                            "-key", os.path.join(VEC, f"hs_{cert}.key"), "-port", str(port), *extra, *go_flags(tls12)],
+                           stdout=subprocess.PIPE, text=True)
     assert srv.stdout.readline().strip() == "ready"
     session, results = None, []
     try:
@@ -111,9 +112,10 @@ def go_client_goose_server(exe, gobin, client_cert=False, cert="ed25519", tls12=
     ls.bind(("127.0.0.1", 0))
     ls.listen(2)
     port = ls.getsockname()[1]
-    extra = [os.path.join(VEC, "hs_client_p256.pem"), os.path.join(VEC, "hs_client_p256.key")] if client_cert else []
-    cli = subprocess.Popen([gobin, "client", str(port), os.path.join(VEC, "hs_root.pem"), "2", *extra],
-                           stdout=subprocess.PIPE, text=True, env=go_env(tls12))
+    extra = ["-cert", os.path.join(VEC, "hs_client_p256.pem"),
+             "-key", os.path.join(VEC, "hs_client_p256.key")] if client_cert else []
+    cli = subprocess.Popen([gobin, "client", "-port", str(port), "-roots", os.path.join(VEC, "hs_root.pem"), "-n", "2",
+                            *extra, *go_flags(tls12)], stdout=subprocess.PIPE, text=True)
     key = os.urandom(32).hex()
     ours = []
     for i in range(2):
@@ -172,8 +174,9 @@ def goose_client_ech(exe, gobin, kem, groups=(), reject=False, want_group=None):
     config, sk = echkey(exe, kem)
     server_config, server_sk = echkey(exe, kem) if reject else (config, sk)
     port = free_port()
-    srv = subprocess.Popen([gobin, "ech-server", os.path.join(VEC, "hs_p256.pem"), os.path.join(VEC, "hs_p256.key"),
-                            str(port), server_config, server_sk], stdout=subprocess.PIPE, text=True)
+    srv = subprocess.Popen([gobin, "ech-server", "-cert", os.path.join(VEC, "hs_p256.pem"),
+                            "-key", os.path.join(VEC, "hs_p256.key"), "-port", str(port),
+                            "-ech-config", server_config, "-ech-key", server_sk], stdout=subprocess.PIPE, text=True)
     assert srv.stdout.readline().strip() == "ready"
     try:
         args = ["client", "localhost", os.path.join(VEC, "hs_root.pem"), "--ech", config_list(config)]
@@ -210,8 +213,9 @@ def go_client_ech(exe, gobin, kem, groups=(), reject=False, want_group=None):
     ls.bind(("127.0.0.1", 0))
     ls.listen(1)
     port = ls.getsockname()[1]
-    cli = subprocess.Popen([gobin, "ech-client", str(port), os.path.join(VEC, "hs_root.pem"), "localhost",
-                            config_list(config)], stdout=subprocess.PIPE, text=True)
+    cli = subprocess.Popen([gobin, "ech-client", "-port", str(port), "-roots", os.path.join(VEC, "hs_root.pem"),
+                            "-server-name", "localhost", "-ech-configs", config_list(config)],
+                           stdout=subprocess.PIPE, text=True)
     sock, _ = ls.accept()
     sock.settimeout(10)
     args = ["server", os.path.join(VEC, "hs_p256.pem"), os.path.join(VEC, "hs_p256.key"),
