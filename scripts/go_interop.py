@@ -10,7 +10,10 @@ server requires and checks, carried over by resumption. Then Encrypted
 Client Hello both ways, for "localhost" behind the public name
 "example.com": accepted with several KEMs and after a HelloRetryRequest,
 and refused with another key, the client getting the server's retry
-configs.
+configs. Then TLS 1.2 both ways: each kind of suite (ECDHE with each
+certificate type and AES-GCM, ChaCha20-Poly1305 or AES-CBC, and RSA key
+exchange), resumed with a session ticket, client certificates, and
+either side stopping at TLS 1.2 while the other takes TLS 1.3 too.
 
     python3 scripts/go_interop.py [--goose PATH]
 """
@@ -52,11 +55,21 @@ def relay_until(peer, sock, done):
     return app
 
 
-def goose_client_go_server(exe, gobin, client_cert=False):
+def go_env(tls12):
+    """The Go side's environment for a TLS 1.2 case: (mode, suites) or None."""
+    env = dict(os.environ)
+    if tls12:
+        env["GOINTEROP_TLS12"] = tls12[0]
+        if tls12[1]:
+            env["GOINTEROP_SUITES"] = tls12[1]
+    return env
+
+
+def goose_client_go_server(exe, gobin, client_cert=False, cert="p256", tls12=None, goose_args=(), want_tail=""):
     port = free_port()
     extra = [os.path.join(VEC, "hs_clientca.pem")] if client_cert else []
-    srv = subprocess.Popen([gobin, "server", os.path.join(VEC, "hs_p256.pem"), os.path.join(VEC, "hs_p256.key"),
-                            str(port), *extra], stdout=subprocess.PIPE, text=True)
+    srv = subprocess.Popen([gobin, "server", os.path.join(VEC, f"hs_{cert}.pem"), os.path.join(VEC, f"hs_{cert}.key"),
+                            str(port), *extra], stdout=subprocess.PIPE, text=True, env=go_env(tls12))
     assert srv.stdout.readline().strip() == "ready"
     session, results = None, []
     try:
@@ -67,16 +80,17 @@ def goose_client_go_server(exe, gobin, client_cert=False):
             if client_cert:
                 args += ["--cert", os.path.join(VEC, "hs_client_ed25519.pem"),
                          "--key", os.path.join(VEC, "hs_client_ed25519.key")]
+            args += list(goose_args)
             peer = Peer(exe, args)
             sock = socket.create_connection(("127.0.0.1", port), timeout=10)
             out, _ = peer.read()
             sock.sendall(out)
-            relay_until(peer, sock, lambda app: peer.state[0] >= 20)
+            relay_until(peer, sock, lambda app: peer.state[0] in (20, 21, 22))
             if peer.state[0] != 20:
                 return False, f"connection {i}: state {peer.state}"
             out, _ = peer.cmd("SEND " + f"hello {i}\n".encode().hex())
             sock.sendall(out)
-            reply = relay_until(peer, sock, lambda app: b"resumed=" in app)
+            reply = relay_until(peer, sock, lambda app: b"resumed=" in app and (not want_tail or b"suite=" in app))
             # Go sends its ticket with the handshake's last flight; it is
             # in by now.
             peer.cmd("SESSION")
@@ -87,26 +101,28 @@ def goose_client_go_server(exe, gobin, client_cert=False):
     finally:
         srv.kill()
     client = "goose client ed25519" if client_cert else "-"
-    want = [(False, f"echo hello 0 resumed=false client={client}"), (True, f"echo hello 1 resumed=true client={client}")]
+    want = [(False, f"echo hello 0 resumed=false client={client}{want_tail}"),
+            (True, f"echo hello 1 resumed=true client={client}{want_tail}")]
     return results == want, results
 
 
-def go_client_goose_server(exe, gobin, client_cert=False):
+def go_client_goose_server(exe, gobin, client_cert=False, cert="ed25519", tls12=None, goose_args=(), want_tail=""):
     ls = socket.socket()
     ls.bind(("127.0.0.1", 0))
     ls.listen(2)
     port = ls.getsockname()[1]
     extra = [os.path.join(VEC, "hs_client_p256.pem"), os.path.join(VEC, "hs_client_p256.key")] if client_cert else []
     cli = subprocess.Popen([gobin, "client", str(port), os.path.join(VEC, "hs_root.pem"), "2", *extra],
-                           stdout=subprocess.PIPE, text=True)
+                           stdout=subprocess.PIPE, text=True, env=go_env(tls12))
     key = os.urandom(32).hex()
     ours = []
     for i in range(2):
         sock, _ = ls.accept()
         sock.settimeout(10)
-        args = ["server", os.path.join(VEC, "hs_ed25519.pem"), os.path.join(VEC, "hs_ed25519.key"), "--ticket-key", key]
+        args = ["server", os.path.join(VEC, f"hs_{cert}.pem"), os.path.join(VEC, f"hs_{cert}.key"), "--ticket-key", key]
         if client_cert:
             args += ["--client-auth", "4", "--client-cas", os.path.join(VEC, "hs_clientca.pem")]
+        args += list(goose_args)
         peer = Peer(exe, args)
         app = b""
         for _ in range(50):
@@ -137,6 +153,7 @@ def go_client_goose_server(exe, gobin, client_cert=False):
     ls.close()
     go = [("resumed=true" in l) for l in lines]
     ok = ours == [False, True] and go == [False, True] and all("reply=\"echo hello" in l for l in lines)
+    ok = ok and all(want_tail in l for l in lines)
     return ok, lines
 
 
@@ -166,7 +183,7 @@ def goose_client_ech(exe, gobin, kem, groups=(), reject=False, want_group=None):
         sock = socket.create_connection(("127.0.0.1", port), timeout=10)
         out, _ = peer.read()
         sock.sendall(out)
-        relay_until(peer, sock, lambda app: peer.state[0] >= 20)
+        relay_until(peer, sock, lambda app: peer.state[0] in (20, 21, 22))
         if reject:
             ok = peer.state[1] == 121 and not peer.state[7] and peer.retry == config_list(server_config)
             detail = (peer.state, peer.retry)
@@ -218,7 +235,7 @@ def go_client_ech(exe, gobin, kem, groups=(), reject=False, want_group=None):
             out, _ = peer.cmd("SEND " + f"echo ech={str(peer.state[7]).lower()}".encode().hex())
             sock.sendall(out)
             break
-        if peer.state[0] >= 21:
+        if peer.state[0] in (21, 22):
             break
     state = peer.state
     sock.close()
@@ -257,6 +274,38 @@ def main():
         ("goose client, ECH refused: Go's retry configs", lambda e, g: goose_client_ech(e, g, "0020", reject=True), None),
         ("Go client, ECH refused: this server's retry configs",
          lambda e, g: go_client_ech(e, g, "0020", reject=True), None),
+    ]
+    # TLS 1.2: each side pinned to it, one suite each, resumed; the
+    # suites by certificate type.
+    for cert, suite in (("p256", "c02b"), ("p384", "c02c"), ("ed25519", "cca9"), ("p521", "c009"), ("p256", "c00a"),
+                        ("rsa", "c02f"), ("rsa", "c030"), ("rsa", "cca8"), ("rsa", "c013"), ("rsa", "c014"),
+                        ("rsa", "009c"), ("rsa", "002f"), ("rsa", "0035")):
+        args = ("--max-version", "0303", "--suite", suite)
+        t = f" v=0303 suite={suite}"
+        cases.append((f"TLS 1.2 goose client, Go {cert} server, {suite}, resumed",
+                      lambda e, g, c=cert, a=args, s=suite, t=t: goose_client_go_server(
+                          e, g, cert=c, tls12=("only", s), goose_args=a, want_tail=t), None))
+        cases.append((f"TLS 1.2 Go client, goose {cert} server, {suite}, resumed",
+                      lambda e, g, c=cert, a=args, s=suite, t=t: go_client_goose_server(
+                          e, g, cert=c, tls12=("only", s), goose_args=a, want_tail=t), None))
+    t12 = " v=0303 suite=c02b"
+    cases += [
+        ("TLS 1.2 goose client's certificate to a Go server, resumed",
+         lambda e, g: goose_client_go_server(e, g, client_cert=True, tls12=("only", ""), goose_args=("--max-version", "0303"),
+                                             want_tail=t12), None),
+        ("TLS 1.2 Go client's certificate to this server, resumed",
+         lambda e, g: go_client_goose_server(e, g, client_cert=True, cert="p256", tls12=("only", ""),
+                                             goose_args=("--max-version", "0303"), want_tail=t12), None),
+        ("goose client stops at TLS 1.2, Go server takes 1.3 too",
+         lambda e, g: goose_client_go_server(e, g, tls12=("both", ""), goose_args=("--max-version", "0303"),
+                                             want_tail=t12), None),
+        ("goose server stops at TLS 1.2, Go client takes 1.3 too",
+         lambda e, g: go_client_goose_server(e, g, cert="p256", tls12=("both", ""), goose_args=("--max-version", "0303"),
+                                             want_tail=t12), None),
+        ("Go server stops at TLS 1.2, goose client takes 1.3 too",
+         lambda e, g: goose_client_go_server(e, g, tls12=("only", ""), want_tail=t12), None),
+        ("Go client stops at TLS 1.2, goose server takes 1.3 too",
+         lambda e, g: go_client_goose_server(e, g, cert="p256", tls12=("only", ""), want_tail=t12), None),
     ]
     for label, fn, cc in cases:
         ok, detail = fn(exe, gobin, cc) if cc is not None else fn(exe, gobin)

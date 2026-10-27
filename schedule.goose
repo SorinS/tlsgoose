@@ -1,7 +1,8 @@
 // tls.schedule: the TLS 1.3 key schedule (RFC 8446 §7.1): HKDF-Expand-Label,
 // Derive-Secret, the early, handshake and master secrets with the traffic
 // secrets derived from them, traffic keys, Finished, KeyUpdate, exporters,
-// resumption PSKs, and a running transcript hash.
+// resumption PSKs, and a running transcript hash; and TLS 1.2's PRF,
+// master secret (extended too), key block, Finished and exporter.
 
 namespace tls;
 
@@ -162,4 +163,74 @@ fn export_keying_material(hash: i64, exporter: const u8[:], label: const u8[:], 
                           len: i64) -> u8[>..] {
     let s = derive_secret(hash, exporter, label, empty_hash(hash));
     return hkdf_expand_label(hash, s, "exporter", bignum::hash_bits(hash, context), len);
+}
+
+// --- TLS 1.2 (RFC 5246 §5, §8, RFC 7627) -----------------------------------------
+
+// PRF(secret, label, seed) for n bytes: P_hash with the suite's hash.
+fn prf12(hash: i64, secret: const u8[:], label: const u8[:], seed: const u8[:], n: i64) -> u8[>..] {
+    var ls: u8[>..] = [];
+    ls.append(label);
+    ls.append(seed);
+    var out: u8[>..] = [];
+    var a = bignum::hmac(hash, secret, ls);          // A(1)
+    while out.len < n {
+        var m: u8[>..] = [];
+        m.append(a);
+        m.append(ls);
+        let p = bignum::hmac(hash, secret, m);
+        out.append(p[..::min(p.len, n - out.len)]);
+        let next = bignum::hmac(hash, secret, a);
+        a = copy(next);
+    }
+    return out;
+}
+
+// The master secret from the premaster secret: over the session hash (the
+// transcript through ClientKeyExchange) with the extended master secret,
+// else over the two randoms.
+fn master_secret12(hash: i64, premaster: const u8[:], ems: bool, session_hash: const u8[:],
+                   client_random: const u8[:], server_random: const u8[:]) -> u8[>..] {
+    if ems { return prf12(hash, premaster, "extended master secret", session_hash, 48); }
+    var seed: u8[>..] = [];
+    seed.append(client_random);
+    seed.append(server_random);
+    return prf12(hash, premaster, "master secret", seed, 48);
+}
+
+// The key block (§6.3): the MAC keys, the write keys and the IVs (fixed
+// IVs: 4 bytes of salt for AES-GCM, 12 for ChaCha20-Poly1305, none for
+// CBC), the client's of each first.
+fn key_block12(s: Suite, master: const u8[:], client_random: const u8[:], server_random: const u8[:]) -> u8[>..] {
+    var seed: u8[>..] = [];
+    seed.append(server_random);
+    seed.append(client_random);
+    let mac_len = s.mac / 8;
+    let iv_len = if s.aead == AEAD_AES_GCM { 4 } else if s.aead == AEAD_CHACHA20_POLY1305 { 12 } else { 0 };
+    return prf12(s.hash, master, "key expansion", seed, 2 * (mac_len + s.key_len + iv_len));
+}
+
+// Finished.verify_data (§7.4.9): 12 bytes over the transcript hash.
+fn finished12(hash: i64, master: const u8[:], client: bool, th: const u8[:]) -> u8[>..] {
+    prf12(hash, master, if client { "client finished" } else { "server finished" }, th, 12)
+}
+
+fn finished12_ok(hash: i64, master: const u8[:], client: bool, th: const u8[:], got: const u8[:]) -> bool {
+    let want = finished12(hash, master, client, th);
+    return got.len == want.len && bignum::ct_eq_bytes(want, got) == 1;
+}
+
+// The exporter of RFC 5705: PRF(master, label, client_random +
+// server_random [+ context length + context]).
+fn export12(hash: i64, master: const u8[:], label: const u8[:], context: const u8[:], has_context: bool,
+            client_random: const u8[:], server_random: const u8[:], len: i64) -> u8[>..] {
+    var seed: u8[>..] = [];
+    seed.append(client_random);
+    seed.append(server_random);
+    if has_context {
+        seed.push((context.len >> 8) as! u8);
+        seed.push(context.len as! u8);
+        seed.append(context);
+    }
+    return prf12(hash, master, label, seed, len);
 }

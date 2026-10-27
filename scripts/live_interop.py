@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live TLS 1.3 interop between this package and OpenSSL.
+"""Live TLS 1.3 and TLS 1.2 interop between this package and OpenSSL.
 
 tools/peer.goose is built natively and run as a subprocess; Python's ssl
 module (OpenSSL) is the other side, through memory BIOs, and this script
@@ -13,7 +13,12 @@ offers its post-quantum hybrid first and so takes X25519 or a retry);
 resumption both ways (also after a HelloRetryRequest); client
 certificates both ways (sent, missing, refused); roots from a directory;
 and failures: an untrusted root, the system's
-roots (which lack the test root), and a wrong host name.
+roots (which lack the test root), and a wrong host name. TLS 1.2 both
+ways: every suite (ECDHE with each certificate type, RSA key exchange,
+GCM, ChaCha20-Poly1305 and CBC), each group, version negotiation with an
+OpenSSL that stops at either version, resumption with session tickets
+(with and without the extended master secret), client certificates and
+ALPN.
 
     python3 scripts/live_interop.py [--goose PATH]
 """
@@ -56,9 +61,9 @@ class Peer:
             elif kind == "SESSION":
                 self.session = None if rest == "-" else rest
             elif kind == "STATE":
-                st, alert, alpn, group, resumed, peer, verified, ech = rest.split()
+                st, alert, alpn, group, resumed, peer, verified, ech, version, suite = rest.split()
                 self.state = (int(st), int(alert), alpn, int(group), resumed == "1", int(peer), verified == "1",
-                              ech == "1")
+                              ech == "1", version, suite)
             elif kind == "RETRY":
                 self.retry = rest
 
@@ -92,7 +97,7 @@ def handshake(peer, obj, inc, outg, goose_is_client):
                 inc.write(out)
         elif done and peer.state[0] == 20:
             break
-        elif peer.state[0] >= 21:
+        elif peer.state[0] in (21, 22):
             break
     return done and peer.state[0] == 20
 
@@ -115,6 +120,19 @@ def exchange(peer, obj, inc, outg):
     return got == b"ping" and app.endswith(b"pong")
 
 
+PY_VERSIONS = {"1.2": "TLSv1_2", "1.3": "TLSv1_3"}
+
+
+def set_versions(ctx, case):
+    """OpenSSL's versions (TLS 1.3 only unless the case says) and suites."""
+    import ssl
+    lo, hi = case.get("py_versions", ("1.3", "1.3"))
+    ctx.minimum_version = getattr(ssl.TLSVersion, PY_VERSIONS[lo])
+    ctx.maximum_version = getattr(ssl.TLSVersion, PY_VERSIONS[hi])
+    if case.get("py_ciphers"):
+        ctx.set_ciphers(case["py_ciphers"])
+
+
 def run_resume_case(case):
     """In the child: two connections, the second resuming the first's session."""
     import ssl
@@ -126,7 +144,7 @@ def run_resume_case(case):
     else:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.load_verify_locations(os.path.join(VEC, "hs_root.pem"))
-    ctx.minimum_version = ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+    set_versions(ctx, case)
     key = os.urandom(32).hex()
     session, py_session = None, None
     result = {"ok": False, "resumed": []}
@@ -143,12 +161,14 @@ def run_resume_case(case):
                     "--ticket-key", key]
         for g in case.get("goose_groups", []):
             args += ["--group", g]
+        args += case.get("goose_args", [])
         peer = Peer(exe, args)
         if not handshake(peer, obj, inc, outg, goose_is_client) or not exchange(peer, obj, inc, outg):
             result["state"] = peer.state
             peer.close()
             return result
         result["resumed"].append([peer.state[4], obj.session_reused])
+        result["goose_state"] = peer.state
         peer.cmd("SESSION")
         session = peer.session
         py_session = obj.session
@@ -170,7 +190,7 @@ def run_case(case):
     else:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.load_verify_locations(os.path.join(VEC, "hs_root.pem"))
-    ctx.minimum_version = ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+    set_versions(ctx, case)
     if case.get("alpn"):
         ctx.set_alpn_protocols(case["alpn"])
     # Client certificates: OpenSSL's server asks for one (required or
@@ -198,6 +218,7 @@ def run_case(case):
                  "--key", os.path.join(VEC, f"hs_{case['goose_cert']}.key")]
     if case.get("goose_client_auth") is not None:
         args += ["--client-auth", str(case["goose_client_auth"]), "--client-cas", os.path.join(VEC, "hs_clientca.pem")]
+    args += case.get("goose_args", [])
     peer = Peer(exe, args)
     to_goose = b""
     result = {"ok": False}
@@ -221,13 +242,14 @@ def run_case(case):
         elif done and peer.state[0] == 20:
             break
         elif not data and not done:
-            if peer.state[0] >= 21:
+            if peer.state[0] in (21, 22):
                 break
     result["goose_state"] = peer.state
     if not (done and peer.state[0] == 20):
         peer.close()
         return result
     result["suite"] = obj.cipher()[0]
+    result["version"] = obj.version()
     result["alpn"] = obj.selected_alpn_protocol()
     if goose_is_client:
         # The certificate OpenSSL's server got from this client, if any.
@@ -357,6 +379,88 @@ def main():
         dict(name="goose server requests: another CA's certificate, unchecked", role="server", cert="rsa",
              py_cert="p384", goose_client_auth=1, want=True, want_peer=True, want_verified=False),
     ]
+    # TLS 1.2: OpenSSL takes TLS 1.2 only; every suite, both ways.
+    tls12 = dict(py_versions=("1.2", "1.2"), want_version="0303")
+    ec12 = [("c02b", "ECDHE-ECDSA-AES128-GCM-SHA256"), ("c02c", "ECDHE-ECDSA-AES256-GCM-SHA384"),
+            ("cca9", "ECDHE-ECDSA-CHACHA20-POLY1305"), ("c009", "ECDHE-ECDSA-AES128-SHA"),
+            ("c00a", "ECDHE-ECDSA-AES256-SHA"), ("c023", "ECDHE-ECDSA-AES128-SHA256")]
+    rsa12 = [("c02f", "ECDHE-RSA-AES128-GCM-SHA256"), ("c030", "ECDHE-RSA-AES256-GCM-SHA384"),
+             ("cca8", "ECDHE-RSA-CHACHA20-POLY1305"), ("c013", "ECDHE-RSA-AES128-SHA"),
+             ("c014", "ECDHE-RSA-AES256-SHA"), ("c027", "ECDHE-RSA-AES128-SHA256"),
+             ("009c", "AES128-GCM-SHA256"), ("009d", "AES256-GCM-SHA384"), ("002f", "AES128-SHA"),
+             ("0035", "AES256-SHA"), ("003c", "AES128-SHA256")]
+    groups12 = ["001d", "0017", "0018", "0019"]
+    n = 0
+    for certs, suites in ((("ed25519", "p256", "p384", "p521"), ec12), (("rsa",), rsa12)):
+        for cert in certs:
+            for sid, name in suites:
+                g = groups12[n % 4]
+                n += 1
+                # In TLS 1.2 the client's groups also limit the curve of an
+                # ECDSA certificate (RFC 8422 §5.1.1), so the client lists it
+                # after the group under test.
+                curve = {"p256": "0017", "p384": "0018", "p521": "0019"}.get(cert, g)
+                for role in ("client", "server"):
+                    who = f"goose client, {cert} server" if role == "client" else f"goose {cert} server"
+                    groups = [g] if role == "server" or curve == g else [g, curve]
+                    # The group is the one under test unless OpenSSL's server
+                    # had two to pick from; RSA key exchange has none.
+                    want_group = int(g, 16) if len(groups) == 1 and not name.startswith("AES") else None
+                    cases.append(dict(tls12, name=f"TLS 1.2 {who}, {name}, {GROUPS[g]}", role=role, cert=cert,
+                                      goose_suites=[sid], goose_groups=groups, py_ciphers=name + ":@SECLEVEL=0",
+                                      want=True, suite=name, want_group=want_group))
+    cases += [
+        # Versions: OpenSSL stops at TLS 1.2 against this side's defaults,
+        # or this side stops at TLS 1.2 against OpenSSL's 1.2 and 1.3.
+        dict(name="goose client (1.2 and 1.3), OpenSSL server stops at 1.2", role="client", cert="p256",
+             py_versions=("1.2", "1.2"), want=True, want_version="0303"),
+        dict(name="goose server (1.2 and 1.3), OpenSSL client stops at 1.2", role="server", cert="rsa",
+             py_versions=("1.2", "1.2"), want=True, want_version="0303"),
+        dict(name="goose server stops at 1.2, OpenSSL client takes 1.3 too", role="server", cert="ed25519",
+             py_versions=("1.2", "1.3"), goose_args=["--max-version", "0303"], want=True, want_version="0303"),
+        dict(name="goose client stops at 1.2, OpenSSL server takes 1.3 too", role="client", cert="p384",
+             py_versions=("1.2", "1.3"), goose_args=["--max-version", "0303"], want=True, want_version="0303"),
+        dict(name="goose client and OpenSSL server, both versions: 1.3", role="client", cert="rsa",
+             py_versions=("1.2", "1.3"), want=True, want_version="0304"),
+        dict(name="goose server stops at 1.2, OpenSSL client wants 1.3", role="server", cert="p256",
+             goose_args=["--max-version", "0303"], want=False, goose_alert=70),
+        dict(name="goose client wants 1.3, OpenSSL server stops at 1.2", role="client", cert="p256",
+             py_versions=("1.2", "1.2"), goose_args=["--min-version", "0304"], want=False, goose_alert=70),
+        # Resumption with session tickets, and without the extended master
+        # secret.
+        dict(tls12, name="TLS 1.2 goose client resumes with OpenSSL's ticket", role="client", cert="p256", resume=True,
+             want=True),
+        dict(tls12, name="TLS 1.2 OpenSSL client resumes with this server's ticket", role="server", cert="rsa",
+             resume=True, want=True),
+        dict(tls12, name="TLS 1.2 goose client resumes, no extended master secret", role="client", cert="ed25519",
+             resume=True, openssl_options="-ExtendedMasterSecret", want=True),
+        dict(tls12, name="TLS 1.2 OpenSSL client resumes, no extended master secret", role="server", cert="p384",
+             resume=True, openssl_options="-ExtendedMasterSecret", want=True),
+        dict(tls12, name="TLS 1.2 goose client, no extended master secret", role="client", cert="rsa",
+             openssl_options="-ExtendedMasterSecret", want=True),
+        dict(tls12, name="TLS 1.2 goose server, no extended master secret", role="server", cert="p256",
+             openssl_options="-ExtendedMasterSecret", want=True),
+        dict(tls12, name="TLS 1.2 goose client, ALPN", role="client", cert="p256", goose_alpn=["h2", "http/1.1"],
+             alpn=["http/1.1"], want=True, want_alpn="http/1.1"),
+        dict(tls12, name="TLS 1.2 goose server, ALPN", role="server", cert="rsa", goose_alpn=["h2", "http/1.1"],
+             alpn=["http/1.1", "h2"], want=True, want_alpn="h2"),
+        dict(tls12, name="TLS 1.2 goose client, wrong host name", role="client", cert="p256", host="other.org",
+             want=False, goose_alert=42),
+    ]
+    for kind in ("client_p256", "client_ed25519"):
+        cases.append(dict(tls12, name=f"TLS 1.2 goose client sends a certificate ({kind[7:]})", role="client",
+                          cert="rsa", goose_cert=kind, py_verify="required", want=True, want_openssl_peer=kind))
+        cases.append(dict(tls12, name=f"TLS 1.2 goose server requires and checks: OpenSSL client's {kind[7:]}",
+                          role="server", cert="p256", py_cert=kind, goose_client_auth=4, want=True, want_peer=True,
+                          want_verified=True))
+    cases += [
+        dict(tls12, name="TLS 1.2 goose client without a certificate, one required", role="client", cert="p256",
+             py_verify="required", want=False),
+        dict(tls12, name="TLS 1.2 goose server requires a certificate, OpenSSL client has none", role="server",
+             cert="p256", goose_client_auth=4, want=False, goose_alert=42),
+        dict(tls12, name="TLS 1.2 goose server checks if given, OpenSSL client has none", role="server", cert="rsa",
+             goose_client_auth=3, want=True, want_peer=False, want_verified=False),
+    ]
     passed = 0
     for case in cases:
         case["exe"] = exe
@@ -364,6 +468,8 @@ def main():
         conf_lines = []
         if case.get("openssl_groups"):
             conf_lines.append(f"Groups = {case['openssl_groups']}")
+        if case.get("openssl_options"):
+            conf_lines.append(f"Options = {case['openssl_options']}")
         if conf_lines:
             conf = os.path.join(tmp, "openssl.cnf")
             with open(conf, "w") as f:
@@ -383,6 +489,8 @@ def main():
             good = r.get("alpn") == case["want_alpn"]
         if good and case.get("want_group"):
             good = r.get("goose_state", [0, 0, 0, 0])[3] == case["want_group"]
+        if good and case.get("want_version"):
+            good = r.get("goose_state", [0] * 10)[8] == case["want_version"]
         if good and case.get("goose_alert"):
             good = r.get("goose_state", [0, 0])[1] == case["goose_alert"]
         if good and "want_peer" in case:

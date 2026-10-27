@@ -16,11 +16,15 @@
 // start and after each command the peer prints "OUT <hex>" if it has bytes
 // to send, "APP <hex>" if it received data, "SESSION <hex|->" when asked,
 // then "STATE <state> <alert> <alpn> <group> <resumed> <peer certificate
-// bytes> <peer verified> <ECH accepted>" and "END"; "RETRY <hex>" with
+// bytes> <peer verified> <ECH accepted> <version> <suite>" (the last two
+// in hex) and "END"; "RETRY <hex>" with
 // the client's retry configs, if it got any. --session <hex> gives the client a
 // session to resume, --ticket-key <hex> the server its ticket key; --cert
 // and --key the client a certificate, --client-auth (tls::NO_CLIENT_CERT
 // ...) and --client-cas the server what it asks of clients.
+// --min-version and --max-version (hex: 0303, 0304) set both sides'
+// versions; a TLS 1.2 --suite goes in the TLS 1.2 list (which it then
+// replaces), a TLS 1.3 one in TLS 1.3's.
 import std;
 import os;
 import tls from "..";
@@ -57,13 +61,19 @@ fn pem_der(path: const u8[:], label: const u8[:]) -> u8[>..] {
     return out;
 }
 
+fn hex16(v: u16) -> u8[>..] {
+    var o: u8[>..] = [];
+    format_uint(o, v, 16, 4, '0');
+    return o;
+}
+
 fn report(c: const tls::Conn&, out: const u8[:], app: const u8[:]) {
     if out.len > 0 { print("OUT ", hex(out)); }
     if app.len > 0 { print("APP ", hex(app)); }
     if c.ech_retry.len > 0 { print("RETRY ", hex(c.ech_retry)); }
     print("STATE ", c.state, " ", c.alert, " ", if c.alpn.len > 0 { c.alpn[..] } else { "-" }, " ", c.group, " ",
           if tls::resumed(c) { 1 } else { 0 }, " ", c.chain.len, " ", if tls::peer_verified(c) { 1 } else { 0 }, " ",
-          if tls::ech_accepted(c) { 1 } else { 0 });
+          if tls::ech_accepted(c) { 1 } else { 0 }, " ", hex16(tls::version(c)), " ", hex16(c.suite.id));
     print("END");
     flush_stdout();
 }
@@ -97,12 +107,18 @@ fn main() {
     var i = 4;
     var cert_path: u8[>..] = [];
     var suites_set = false;
+    var suites12_set = false;
     var groups_set = false;
     while i + 1 < a.len {
         if a[i] == "--suite" || a[i] == "--group" {
             let v = unhex(a[i + 1]);
             let id: u16 = (v[0] as u16) << 8 | v[1];
-            if a[i] == "--suite" {
+            let st, oks = tls::suite(id);
+            if a[i] == "--suite" && oks && tls::is_tls12_suite(st) {
+                if !suites12_set { cc.suites12.clear(); sc.suites12.clear(); suites12_set = true; }
+                cc.suites12.push(id);
+                sc.suites12.push(id);
+            } else if a[i] == "--suite" {
                 if !suites_set { cc.suites.clear(); sc.suites.clear(); suites_set = true; }
                 cc.suites.push(id);
                 sc.suites.push(id);
@@ -111,6 +127,11 @@ fn main() {
                 cc.groups.push(id);
                 sc.groups.push(id);
             }
+        } else if a[i] == "--min-version" || a[i] == "--max-version" {
+            let v = unhex(a[i + 1]);
+            let ver: u16 = (v[0] as u16) << 8 | v[1];
+            if a[i] == "--min-version" { cc.min_version = ver; sc.min_version = ver; }
+            else { cc.max_version = ver; sc.max_version = ver; }
         } else if a[i] == "--alpn" {
             tls::add_alpn(cc.alpn, a[i + 1]);
             tls::add_alpn(sc.alpn, a[i + 1]);

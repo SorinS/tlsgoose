@@ -12,6 +12,11 @@
 //	gointerop ech-client <port> <roots.pem> <server name> <ECHConfigList hex> [groups]
 //	    one connection offering ECH; prints whether it was accepted and the reply, or the
 //	    rejection's retry configs; groups (comma-separated ids, hex) set CurvePreferences
+//
+// For server and client, $GOINTEROP_TLS12 pins TLS 1.2 ("only") or lets
+// it be negotiated ("both"), $GOINTEROP_SUITES (comma-separated ids, hex)
+// sets CipherSuites, and the line each connection prints or echoes ends
+// with v=<version> suite=<suite>, in hex.
 package main
 
 import (
@@ -26,6 +31,30 @@ import (
 	"strconv"
 	"strings"
 )
+
+// versions applies $GOINTEROP_TLS12 and $GOINTEROP_SUITES to a config.
+func versions(cfg *tls.Config) {
+	switch os.Getenv("GOINTEROP_TLS12") {
+	case "only":
+		cfg.MinVersion, cfg.MaxVersion = tls.VersionTLS12, tls.VersionTLS12
+	case "both":
+		cfg.MinVersion, cfg.MaxVersion = tls.VersionTLS12, tls.VersionTLS13
+	}
+	if s := os.Getenv("GOINTEROP_SUITES"); s != "" {
+		for _, x := range strings.Split(s, ",") {
+			v, _ := strconv.ParseUint(x, 16, 16)
+			cfg.CipherSuites = append(cfg.CipherSuites, uint16(v))
+		}
+	}
+}
+
+// tail is what a line ends with: the version and suite, under $GOINTEROP_TLS12.
+func tail(st tls.ConnectionState) string {
+	if os.Getenv("GOINTEROP_TLS12") == "" {
+		return ""
+	}
+	return fmt.Sprintf(" v=%04x suite=%04x", st.Version, st.CipherSuite)
+}
 
 func main() {
 	switch os.Args[1] {
@@ -44,6 +73,7 @@ func main() {
 			cfg.ClientCAs.AppendCertsFromPEM(pem)
 			cfg.ClientAuth = tls.RequireAndVerifyClientCert
 		}
+		versions(cfg)
 		ln, err := tls.Listen("tcp", "127.0.0.1:"+os.Args[4], cfg)
 		if err != nil {
 			panic(err)
@@ -65,7 +95,7 @@ func main() {
 				if len(st.PeerCertificates) > 0 {
 					client = st.PeerCertificates[0].Subject.CommonName
 				}
-				fmt.Fprintf(c, "echo %s resumed=%v client=%s", line[:len(line)-1], st.DidResume, client)
+				fmt.Fprintf(c, "echo %s resumed=%v client=%s%s", line[:len(line)-1], st.DidResume, client, tail(st))
 			}(c)
 		}
 	case "ech-server":
@@ -146,6 +176,7 @@ func main() {
 			}
 			cfg.Certificates = []tls.Certificate{cert}
 		}
+		versions(cfg)
 		n, _ := strconv.Atoi(os.Args[4])
 		for i := 0; i < n; i++ {
 			c, err := tls.Dial("tcp", "127.0.0.1:"+os.Args[2], cfg)
@@ -157,7 +188,7 @@ func main() {
 			buf := make([]byte, 100)
 			k, _ := c.Read(buf)
 			st := c.ConnectionState()
-			fmt.Printf("conn %d resumed=%v group=%v reply=%q\n", i, st.DidResume, st.CurveID, buf[:k])
+			fmt.Printf("conn %d resumed=%v group=%v%s reply=%q\n", i, st.DidResume, st.CurveID, tail(st), buf[:k])
 			c.Close()
 		}
 	}
