@@ -1482,9 +1482,12 @@ fn certificate_message(context: const u8[:], chain: const u8[:]) -> u8[>..], boo
 // when signing fails.
 fn certificate_verify_message(key: const x509::PrivateKey&, scheme: u16, server_side: bool,
                               th: const u8[:]) -> u8[>..], bool {
-    var cv: u8[>..] = [];
     let sig, ok = sign(key, scheme, cv_content(server_side, th));
-    if !ok { return cv, false; }
+    if !ok {
+        var none: u8[>..] = [];
+        return none, false;
+    }
+    var cv: u8[>..] = [];
     put_u16(cv, scheme);
     put_u16(cv, sig.len as! u16);
     cv.append(sig);

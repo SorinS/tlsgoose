@@ -214,6 +214,12 @@ fn main() {
     let sc14 = server_cfg(tls::REQUEST_CLIENT_CERT);
     let o15 = connect(mismatched, sc14);
     check("key not the certificate's", !o15.ok && o15.server_alert == tls::ALERT_ILLEGAL_PARAMETER);
+    // The same in TLS 1.2, where the scheme is refused before any
+    // signature check too.
+    var mismatched12 = mismatched;
+    mismatched12.max_version = tls::VERSION_TLS12;
+    let o15b = connect(mismatched12, sc14);
+    check("key not the certificate's, TLS 1.2", !o15b.ok && o15b.server_alert == tls::ALERT_ILLEGAL_PARAMETER);
     var junk = client_cfg();
     check("junk key refused", !tls::set_client_certificate(junk, field("client", "p256", 2), "junk"));
 

@@ -304,6 +304,9 @@ fn client_server_key_exchange12(c: Conn&, cfg: const ClientConfig&, m: const u8[
     signed.append(c.peer_random);
     signed.append(m[4..params_end]);
     let leaf, okl = peer_leaf(c);
+    // A scheme that does not fit the key is refused before any signature
+    // check, as TLS 1.3's (RFC 8446 §4.4.3); Go gives decrypt_error.
+    if okl && !scheme_fits12(leaf.key_type, scheme as! u16) { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
     if !okl || !verify12(leaf, scheme as! u16, signed, m[sig.pos..sig.end]) { return fail(c, ALERT_DECRYPT_ERROR, out); }
     c.group = group as! u16;
     c.peer_share.clear();
@@ -742,6 +745,7 @@ fn server_certificate_verify12(c: Conn&, m: const u8[:], out: u8[>..]&) -> i64 {
     if !offered_scheme(SIG_SCHEMES12, scheme as! u16) { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
     if c.log_over { return fail(c, ALERT_INTERNAL_ERROR, out); }
     let leaf, okl = peer_leaf(c);
+    if okl && !scheme_fits12(leaf.key_type, scheme as! u16) { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
     if !okl || !verify12(leaf, scheme as! u16, c.log, m[sig.pos..sig.end]) { return fail(c, ALERT_DECRYPT_ERROR, out); }
     hs_add(c, m);
     c.state = ST12_WAIT_CLIENT_CCS;
