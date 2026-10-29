@@ -294,6 +294,18 @@ fn oversized_handshake() {
     var app: u8[>..] = [];
     let r = tls::server_feed(s, sc, rec, out, app);
     check("oversized handshake message: decode_error", r == -1 && s.alert == tls::ALERT_DECODE_ERROR);
+    // An empty cipher_suites, which must hold at least one suite: as
+    // tlsfuzzer makes it from a hello with an empty session ID and one
+    // extension, by setting the session ID's length to 5.
+    var hello: u8[>..] = [3, 3];
+    for i in 32 { hello.push(i as! u8); }
+    hello.append([5, 0, 2, 0, 0x2f, 1, 0, 0, 5, 0xff, 1, 0, 1, 0]);
+    var rec2: u8[>..] = [22, 3, 1, 0, (hello.len + 4) as! u8, 1, 0, 0, hello.len as! u8];
+    rec2.append(hello);
+    var s2 = tls::server(sc);
+    var out2: u8[>..] = [];
+    let r2 = tls::server_feed(s2, sc, rec2, out2, app);
+    check("empty cipher_suites: decode_error", r2 == -1 && s2.alert == tls::ALERT_DECODE_ERROR);
 }
 
 fn client_failures() {

@@ -1675,7 +1675,11 @@ fn parse_hello(m: const u8[:]) -> Hello, bool {
     h.sid = get_vec(b, m, 1);
     h.suites = get_vec(b, m, 2);
     let comp = get_vec(b, m, 1);
-    if b.bad || h.sid.end - h.sid.pos > 32 || comp.end == comp.pos || (h.suites.end - h.suites.pos) % 2 != 0 {
+    // cipher_suites<2..2^16-2>, legacy_compression_methods<1..2^8-1>
+    // (RFC 8446 §4.1.2, RFC 5246 §7.4.1.2): an empty list of either is a
+    // malformed message, decode_error, not a hello with nothing in common.
+    let nsuites = h.suites.end - h.suites.pos;
+    if b.bad || h.sid.end - h.sid.pos > 32 || comp.end == comp.pos || nsuites == 0 || nsuites % 2 != 0 {
         return h, false;
     }
     // The null compression method: offered (RFC 5246 §7.4.1.2), and alone
