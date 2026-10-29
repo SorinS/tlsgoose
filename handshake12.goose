@@ -384,7 +384,8 @@ fn client_server_hello_done12(c: Conn&, cfg: const ClientConfig&, m: const u8[:]
     set48(c.master, master_secret12(c.suite.hash, pms, c.ems, transcript_hash(c.th), c.random, c.peer_random));
     if c.cert_scheme != 0 {
         if c.log_over { return fail(c, ALERT_INTERNAL_ERROR, out); }
-        let sig = sign(cfg.cert_key, c.cert_scheme, c.log);
+        let sig, oks = sign(cfg.cert_key, c.cert_scheme, c.log);
+        if !oks { return fail(c, ALERT_INTERNAL_ERROR, out); }
         var cv: u8[>..] = [];
         put_u16(cv, c.cert_scheme);
         put_u16(cv, sig.len as! u16);
@@ -429,6 +430,7 @@ fn client_new_session_ticket12(c: Conn&, cfg: const ClientConfig&, m: const u8[:
 // Finished follow it. A resumed session without a new ticket stays the
 // client's session.
 fn client_finished12(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8[>..]&) -> i64 {
+    if m.len - 4 != 12 { return fail(c, ALERT_DECODE_ERROR, out); }
     if !finished12_ok(c.suite.hash, c.master, false, transcript_hash(c.th), m[4..]) {
         return fail(c, ALERT_DECRYPT_ERROR, out);
     }
@@ -475,25 +477,27 @@ fn client_message12(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8[
 fn server_client_hello12(c: Conn&, cfg: const ServerConfig&, m: const u8[:], h: const Hello&, out: u8[>..]&) -> i64 {
     c.version = VERSION_TLS12;
     // TLS_FALLBACK_SCSV from a client that could do better (RFC 7507).
-    if in_u16_list(m, h.suites, TLS_FALLBACK_SCSV) && cfg.max_version > VERSION_TLS12 {
+    if in_u16_list(m, h.suites, TLS_FALLBACK_SCSV) && client_max_version(h) < cfg.max_version {
         return fail(c, ALERT_INAPPROPRIATE_FALLBACK, out);
     }
     // Secure renegotiation: an empty renegotiation_info, or the SCSV.
     if h.has_reneg && !h.reneg_empty { return fail(c, ALERT_HANDSHAKE_FAILURE, out); }
     c.secure_reneg = h.has_reneg || in_u16_list(m, h.suites, TLS_EMPTY_RENEGOTIATION_INFO_SCSV);
-    c.peer_schemes.clear();
-    var sl = h.schemes;
-    while sl.pos + 1 < sl.end && c.peer_schemes.len < c.peer_schemes.cap { c.peer_schemes.push(get_u16(sl, m) as! u16); }
+    take_peer_schemes(c, m, h.schemes, SIG_SCHEMES12);
     let scheme = pick_scheme12(cfg.key.kind, c.peer_schemes);
     // ECDHE: the server's first ECDH group the client takes, if it takes
     // uncompressed points (as it does without the extension, RFC 8422
     // §5.1.2).
+    // A list without uncompressed is refused (RFC 8422 §5.1.2). Without
+    // supported_groups the client takes any curve (RFC 8422 §4): P-256.
     var points_ok = !h.has_points;
     var pl = h.points;
     while pl.pos < pl.end { if get_u8(pl, m) == 0 { points_ok = true; } }
+    if !points_ok { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
     var group: u16 = 0;
-    if points_ok {
-        for g in cfg.groups { if group == 0 && ecdh_group12(g) && in_u16_list(m, h.groups, g) { group = g; } }
+    for g in cfg.groups {
+        let offered = if h.has_groups { in_u16_list(m, h.groups, g) } else { g == GROUP_SECP256R1 };
+        if group == 0 && ecdh_group12(g) && offered { group = g; }
     }
     // The suite: the server's first that the client offers and the key,
     // group and schemes allow.
@@ -513,6 +517,7 @@ fn server_client_hello12(c: Conn&, cfg: const ServerConfig&, m: const u8[:], h: 
     c.ems = h.ems;
     c.ticket12 = h.has_ticket && cfg.tickets > 0;
     for i in 32 { c.peer_random[i] = m[h.random.pos + i]; }
+    c.client_version = h.version as! u16;
     // Resumption: a TLS 1.2 ticket of ours, unexpired, for a suite both
     // still take, with a client certificate that suits, and with the
     // extended master secret if it had one (a session that had it is
@@ -611,7 +616,8 @@ fn server_client_hello12(c: Conn&, cfg: const ServerConfig&, m: const u8[:], h: 
         signed.append(c.peer_random);
         signed.append(c.random);
         signed.append(ske);
-        let sig = sign(cfg.key, scheme, signed);
+        let sig, oks = sign(cfg.key, scheme, signed);
+        if !oks { return fail(c, ALERT_INTERNAL_ERROR, out); }
         put_u16(ske, scheme);
         put_u16(ske, sig.len as! u16);
         ske.append(sig);
@@ -684,10 +690,10 @@ fn server_client_certificate12(c: Conn&, cfg: const ServerConfig&, m: const u8[:
 }
 
 // ClientKeyExchange: the client's ECDH share, or its RSA-encrypted
-// premaster secret. A ciphertext that does not decrypt to 48 bytes leaves
-// a random premaster secret in its place, with nothing to tell the two
-// apart until Finished fails (RFC 5246 §7.4.7.1); its version is not
-// checked, as in Go.
+// premaster secret. A ciphertext that does not decrypt to 48 bytes, or
+// whose first two bytes are not the ClientHello's version, leaves a random
+// premaster secret in its place, chosen in constant time, with nothing to
+// tell them apart until Finished fails (RFC 5246 §7.4.7.1).
 fn server_client_key_exchange12(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: u8[>..]&) -> i64 {
     var b = Rd { pos: 4, end: m.len, bad: false };
     var pms: u8[>..] = [];
@@ -696,13 +702,27 @@ fn server_client_key_exchange12(c: Conn&, cfg: const ServerConfig&, m: const u8[
         if !done(b) { return fail(c, ALERT_DECODE_ERROR, out); }
         var p: u8[48] = [0; 48];
         drbg_fill(c, p);
-        if !bignum::rsa_decrypt_pkcs1_session_key(cfg.key.rsa, m[enc.pos..enc.end], p) {
-            return fail(c, ALERT_DECODE_ERROR, out);
+        var random: u8[48] = [0; 48];
+        for i in 48 { random[i] = p[i]; }
+        // A ciphertext the RSA operation refuses (of the wrong length, or
+        // not below the modulus) is treated as any bad one: the random
+        // premaster secret stays, and Finished fails.
+        let ok = bignum::rsa_decrypt_pkcs1_session_key(cfg.key.rsa, m[enc.pos..enc.end], p);
+        let hi: u32 = c.client_version >> 8;
+        let lo: u32 = c.client_version & 0xff;
+        let a: u32 = p[0];
+        let b: u32 = p[1];
+        let mask = bignum::ct_mask(bignum::ct_eq_u32(a, hi) & bignum::ct_eq_u32(b, lo));
+        for i in 48 {
+            let x: u32 = p[i];
+            let y: u32 = random[i];
+            p[i] = bignum::ct_select_u32(mask, x, y) as! u8;
         }
         pms.append(p);
     } else {
+        // ECPoint is <1..2^8-1> (RFC 8422 §5.7).
         let p = get_vec(b, m, 1);
-        if !done(b) { return fail(c, ALERT_DECODE_ERROR, out); }
+        if !done(b) || p.end == p.pos { return fail(c, ALERT_DECODE_ERROR, out); }
         let shared, ok = ecdh_secret(c, c.group, m[p.pos..p.end]);
         if !ok { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
         pms.append(shared);
@@ -731,6 +751,7 @@ fn server_certificate_verify12(c: Conn&, m: const u8[:], out: u8[>..]&) -> i64 {
 // The client's Finished; after a full handshake the server's
 // [NewSessionTicket], change_cipher_spec and Finished follow it.
 fn server_finished12(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: u8[>..]&) -> i64 {
+    if m.len - 4 != 12 { return fail(c, ALERT_DECODE_ERROR, out); }
     if !finished12_ok(c.suite.hash, c.master, true, transcript_hash(c.th), m[4..]) {
         return fail(c, ALERT_DECRYPT_ERROR, out);
     }

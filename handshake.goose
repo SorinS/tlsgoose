@@ -75,6 +75,7 @@ let EXT_COOKIE: u16 = 44;
 let EXT_KEY_SHARE: u16 = 51;
 let EXT_PRE_SHARED_KEY: u16 = 41;
 let EXT_EARLY_DATA: u16 = 42;
+let EXT_PADDING: u16 = 21;
 let EXT_PSK_KEY_EXCHANGE_MODES: u16 = 45;
 let EXT_CERTIFICATE_AUTHORITIES: u16 = 47;
 // TLS 1.2's: point formats (RFC 8422), extended master secret (RFC 7627),
@@ -142,6 +143,13 @@ let SIG_SCHEMES: u16[13] = [0x0904, 0x0905, 0x0906, 0x0403, 0x0503, 0x0603, 0x08
                             0x0401, 0x0501, 0x0601];
 
 let MAX_HANDSHAKE: i64 = 65536;
+
+// Records in a row that carry nothing (empty, or TLS 1.2 warning
+// alerts) before the connection ends, as Go's maxUselessRecords.
+let MAX_USELESS_RECORDS: i64 = 16;
+
+// How much refused 0-RTT data the server skips (RFC 8446 §4.2.10).
+let MAX_EARLY_SKIP: i64 = 1 << 16;
 
 // What a client needs: the name it connects to (SNI and the certificate
 // check), whether to check the certificate, the time for that check (0:
@@ -287,6 +295,12 @@ struct Conn {
     group: u16, group2: u16,          // the share's group, and a second share's (X25519 beside the hybrid)
     x25519_sk: u8[32], ec_sk: u8[..66], mlkem_seed: u8[64],
     hrr: bool, ccs_sent: bool, cert_requested: bool, cr_context: u8[..255],
+    ccs_seen: bool,                   // TLS 1.3: the peer's one change_cipher_spec came
+    useless: i64,                     // records in a row that carried nothing (warnings, empty data)
+    skip_early: bool, early_skipped: i64,  // the server skips the 0-RTT data it refused, and how much
+    ch1_digest: u8[32],               // the server's: what of the first ClientHello the second must repeat
+    client_version: u16,              // TLS 1.2 server: the ClientHello's legacy_version, for RSA's premaster secret
+
     cert_scheme: u16,                 // the client's: the scheme of its CertificateVerify (0: no certificate)
     peer_verified: bool,              // the peer's certificate was checked against the roots
     peer_schemes: u16[..32], alpn: u8[..255], sni: u8[..255],
@@ -333,6 +347,7 @@ fn new_conn(is_server: bool, seed: u64) -> Conn {
         read: record_keys(s, zero), write: record_keys(s, zero), read_protected: false, write_protected: false,
         drbg_k: [0; 32], drbg_v: [1; 32], random: [0; 32], session_id: [],
         group: 0, group2: 0, x25519_sk: [0; 32], ec_sk: [], mlkem_seed: [0; 64], hrr: false, ccs_sent: false, cert_requested: false,
+        ccs_seen: false, useless: 0, skip_early: false, early_skipped: 0, ch1_digest: [0; 32], client_version: 0,
         cr_context: [], cert_scheme: 0, peer_verified: false, peer_schemes: [], alpn: [], sni: [], tickets: 0, key_updates: 0,
         psk_offered: false, resumed: false, psk_dhe: false, peer_not_after: 0, has_session: false, session: no_session(),
         ech_offered: false, ech_seen: false, ech_confirm: false, ech_accepted: false, ech_backend: false,
@@ -727,6 +742,21 @@ fn offered_scheme(list: const u16[:], s: u16) -> bool {
 
 // The scheme to sign CertificateVerify with, for a key and the peer's list;
 // 0 for none.
+// Whether a TLS 1.3 CertificateVerify may use a scheme with a key: RSA
+// with PSS only, ECDSA with its curve's hash, Ed25519 and ML-DSA with
+// their own (RFC 8446 §4.2.3, §4.4.3).
+fn scheme_fits13(kind: i64, s: u16) -> bool {
+    if kind == x509::KEY_RSA {
+        return s == x509::RSA_PSS_RSAE_SHA256 || s == x509::RSA_PSS_RSAE_SHA384 || s == x509::RSA_PSS_RSAE_SHA512;
+    }
+    if kind == x509::KEY_EC_P256 { return s == x509::ECDSA_SECP256R1_SHA256; }
+    if kind == x509::KEY_EC_P384 { return s == x509::ECDSA_SECP384R1_SHA384; }
+    if kind == x509::KEY_EC_P521 { return s == x509::ECDSA_SECP521R1_SHA512; }
+    if kind == x509::KEY_ED25519 { return s == x509::ED25519; }
+    if x509::is_mldsa(kind) { return s == x509::mldsa_scheme(x509::mldsa_set(kind)); }
+    return false;
+}
+
 fn pick_scheme(key: const x509::PrivateKey&, peer: const u16[:]) -> u16 {
     if key.kind == x509::KEY_ED25519 && offered_scheme(peer, x509::ED25519) { return x509::ED25519; }
     if x509::is_mldsa(key.kind) {
@@ -744,19 +774,26 @@ fn pick_scheme(key: const x509::PrivateKey&, peer: const u16[:]) -> u16 {
     return 0;
 }
 
-fn sign(key: const x509::PrivateKey&, scheme: u16, msg: const u8[:]) -> u8[>..] {
-    if scheme == x509::ED25519 { return x509::sign(key, x509::SIG_ED25519, 0, msg); }
-    if scheme == x509::MLDSA44 || scheme == x509::MLDSA65 || scheme == x509::MLDSA87 {
-        return x509::sign(key, x509::SIG_MLDSA, x509::mldsa_set(key.kind), msg);
+// A signature with a scheme, and false when signing fails (x509::sign):
+// the handshake then ends with internal_error, as Go's does.
+fn sign(key: const x509::PrivateKey&, scheme: u16, msg: const u8[:]) -> u8[>..], bool {
+    var alg = x509::SIG_RSA_PSS;
+    var h: i64 = 512;
+    if scheme == x509::ED25519 { alg = x509::SIG_ED25519; h = 0; }
+    else if scheme == x509::MLDSA44 || scheme == x509::MLDSA65 || scheme == x509::MLDSA87 {
+        alg = x509::SIG_MLDSA;
+        h = x509::mldsa_set(key.kind);
     }
-    if scheme == x509::ECDSA_SECP256R1_SHA256 { return x509::sign(key, x509::SIG_ECDSA, 256, msg); }
-    if scheme == x509::ECDSA_SECP384R1_SHA384 { return x509::sign(key, x509::SIG_ECDSA, 384, msg); }
-    if scheme == x509::ECDSA_SECP521R1_SHA512 { return x509::sign(key, x509::SIG_ECDSA, 512, msg); }
-    if scheme == x509::RSA_PKCS1_SHA256 { return x509::sign(key, x509::SIG_RSA_PKCS1, 256, msg); }
-    if scheme == x509::RSA_PKCS1_SHA384 { return x509::sign(key, x509::SIG_RSA_PKCS1, 384, msg); }
-    if scheme == x509::RSA_PKCS1_SHA512 { return x509::sign(key, x509::SIG_RSA_PKCS1, 512, msg); }
-    let h = if scheme == x509::RSA_PSS_RSAE_SHA256 { 256 } else if scheme == x509::RSA_PSS_RSAE_SHA384 { 384 } else { 512 };
-    return x509::sign(key, x509::SIG_RSA_PSS, h, msg);
+    else if scheme == x509::ECDSA_SECP256R1_SHA256 { alg = x509::SIG_ECDSA; h = 256; }
+    else if scheme == x509::ECDSA_SECP384R1_SHA384 { alg = x509::SIG_ECDSA; h = 384; }
+    else if scheme == x509::ECDSA_SECP521R1_SHA512 { alg = x509::SIG_ECDSA; h = 512; }
+    else if scheme == x509::RSA_PKCS1_SHA256 { alg = x509::SIG_RSA_PKCS1; h = 256; }
+    else if scheme == x509::RSA_PKCS1_SHA384 { alg = x509::SIG_RSA_PKCS1; h = 384; }
+    else if scheme == x509::RSA_PKCS1_SHA512 { alg = x509::SIG_RSA_PKCS1; h = 512; }
+    else if scheme == x509::RSA_PSS_RSAE_SHA256 { h = 256; }
+    else if scheme == x509::RSA_PSS_RSAE_SHA384 { h = 384; }
+    let sig, ok = x509::sign(key, alg, h, msg);
+    return sig, ok;
 }
 
 // The alert for a certificate the client refuses.
@@ -1340,6 +1377,7 @@ fn peer_certificate_verify(c: Conn&, m: const u8[:], out: u8[>..]&) -> i64 {
     let ct, okt = asn1::read(c.chain, 0, c.chain.len);
     let leaf, e = x509::parse(c.chain[..ct.end]);
     if e != x509::OK { return fail(c, ALERT_BAD_CERTIFICATE, out); }
+    if !scheme_fits13(leaf.key_type, scheme as! u16) { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
     let content = cv_content(!c.is_server, transcript_hash(c.th));
     if x509::verify_scheme(leaf, scheme as! u16, content, m[sig.pos..sig.end]) != x509::OK {
         return fail(c, ALERT_DECRYPT_ERROR, out);
@@ -1440,18 +1478,21 @@ fn certificate_message(context: const u8[:], chain: const u8[:]) -> u8[>..], boo
     return handshake_message(HS_CERTIFICATE, body), true;
 }
 
-// A CertificateVerify by `key` over the transcript hash `th`.
+// A CertificateVerify by `key` over the transcript hash `th`, and false
+// when signing fails.
 fn certificate_verify_message(key: const x509::PrivateKey&, scheme: u16, server_side: bool,
-                              th: const u8[:]) -> u8[>..] {
-    let sig = sign(key, scheme, cv_content(server_side, th));
+                              th: const u8[:]) -> u8[>..], bool {
     var cv: u8[>..] = [];
+    let sig, ok = sign(key, scheme, cv_content(server_side, th));
+    if !ok { return cv, false; }
     put_u16(cv, scheme);
     put_u16(cv, sig.len as! u16);
     cv.append(sig);
-    return handshake_message(HS_CERTIFICATE_VERIFY, cv);
+    return handshake_message(HS_CERTIFICATE_VERIFY, cv), true;
 }
 
 fn client_finished(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8[>..]&) -> i64 {
+    if m.len - 4 != c.suite.hash / 8 { return fail(c, ALERT_DECODE_ERROR, out); }
     if !finished_ok(c.suite.hash, c.sch.s_hs, transcript_hash(c.th), m[4..]) {
         return fail(c, ALERT_DECRYPT_ERROR, out);
     }
@@ -1471,7 +1512,9 @@ fn client_finished(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8[>
         let cm, okm = certificate_message(c.cr_context, cfg.cert_chain);
         if !okm { return fail(c, ALERT_INTERNAL_ERROR, out); }
         send_hs(c, cm, out);
-        send_hs(c, certificate_verify_message(cfg.cert_key, c.cert_scheme, false, transcript_hash(c.th)), out);
+        let cv, okv = certificate_verify_message(cfg.cert_key, c.cert_scheme, false, transcript_hash(c.th));
+        if !okv { return fail(c, ALERT_INTERNAL_ERROR, out); }
+        send_hs(c, cv, out);
     }
     let fin = finished_data(c.suite.hash, c.sch.c_hs, transcript_hash(c.th));
     send_hs(c, handshake_message(HS_FINISHED, fin), out);
@@ -1556,6 +1599,8 @@ struct Hello {
     psk_ids: Rd, psk_binders: Rd, binders_at: i64, has_psk: bool, psk_dhe: bool,
     version: i64, has_versions: bool, has_versions12: bool, points: Rd, has_points: bool, ems: bool,
     has_reneg: bool, reneg_empty: bool, ticket: Rd, has_ticket: bool,
+    comp_null_only: bool, early_data: bool,
+    alert: u8,                        // when parsing fails: the alert, if not decode_error
 }
 
 fn empty_rd() -> Rd { Rd { pos: 0, end: 0, bad: false } }
@@ -1568,6 +1613,7 @@ fn parse_hello(m: const u8[:]) -> Hello, bool {
         psk_ids: empty_rd(), psk_binders: empty_rd(), binders_at: 0, has_psk: false, psk_dhe: false,
         version: 0, has_versions: false, has_versions12: false, points: empty_rd(), has_points: false, ems: false,
         has_reneg: false, reneg_empty: false, ticket: empty_rd(), has_ticket: false,
+        comp_null_only: false, early_data: false, alert: 0,
     };
     var b = Rd { pos: 4, end: m.len, bad: false };
     let ver = get_u16(b, m);
@@ -1576,15 +1622,35 @@ fn parse_hello(m: const u8[:]) -> Hello, bool {
     h.sid = get_vec(b, m, 1);
     h.suites = get_vec(b, m, 2);
     let comp = get_vec(b, m, 1);
-    if b.bad || h.sid.end - h.sid.pos > 32 || ver < 0x0301 { return h, false; }
-    // Only the null compression method, alone (§4.1.2).
-    if comp.end - comp.pos != 1 || m[comp.pos] != 0 { return h, false; }
-    var exts = get_vec(b, m, 2);
+    if b.bad || h.sid.end - h.sid.pos > 32 || comp.end == comp.pos || (h.suites.end - h.suites.pos) % 2 != 0 {
+        return h, false;
+    }
+    // The null compression method: offered (RFC 5246 §7.4.1.2), and alone
+    // for TLS 1.3 (§4.1.2), which server_client_hello checks.
+    var has_null = false;
+    for i in comp.pos..comp.end { if m[i] == 0 { has_null = true; } }
+    if !has_null { h.alert = ALERT_ILLEGAL_PARAMETER; return h, false; }
+    h.comp_null_only = comp.end - comp.pos == 1;
+    // A TLS 1.2 hello may end here, with no extensions (RFC 5246 §7.4.1.2).
+    var exts = if b.pos == b.end { empty_rd() } else { get_vec(b, m, 2) };
     if !done(b) { return h, false; }
+    // No extension twice (RFC 8446 §4.2, RFC 5246 §7.4.1.4): types below
+    // 64 in a mask, the first 16 above in a list (renegotiation_info and
+    // encrypted_client_hello among them, in any real ClientHello).
+    var seen: u64 = 0;
+    var seen_high: u16[..16] = [];
     while exts.pos < exts.end {
         let ty = get_u16(exts, m);
         var e = get_vec(exts, m, 2);
         if exts.bad { return h, false; }
+        if ty < 64 {
+            let bit: u64 = 1 << ty;
+            if seen & bit != 0 { return h, false; }
+            seen = seen | bit;
+        } else {
+            for t in seen_high { if t == ty { return h, false; } }
+            if seen_high.len < seen_high.cap { seen_high.push(ty as! u16); }
+        }
         if ty == EXT_SUPPORTED_VERSIONS {
             var l = get_vec(e, m, 1);
             h.has_versions = true;
@@ -1597,6 +1663,7 @@ fn parse_hello(m: const u8[:]) -> Hello, bool {
         } else if ty == EXT_EC_POINT_FORMATS {
             h.points = get_vec(e, m, 1);
             h.has_points = true;
+            if h.points.end == h.points.pos { return h, false; }
         } else if ty == EXT_EXTENDED_MASTER_SECRET {
             h.ems = true;
         } else if ty == EXT_RENEGOTIATION_INFO {
@@ -1609,19 +1676,51 @@ fn parse_hello(m: const u8[:]) -> Hello, bool {
         } else if ty == EXT_SUPPORTED_GROUPS {
             h.groups = get_vec(e, m, 2);
             h.has_groups = true;
+            if h.groups.end == h.groups.pos || (h.groups.end - h.groups.pos) % 2 != 0 { return h, false; }
         } else if ty == EXT_KEY_SHARE {
             h.shares = get_vec(e, m, 2);
             h.has_shares = true;
+            // Each entry whole: a group and a non-empty key.
+            var l = h.shares;
+            while l.pos < l.end {
+                let g = get_u16(l, m);
+                let k = get_vec(l, m, 2);
+                if k.end == k.pos { l.bad = true; }
+            }
+            if l.bad { return h, false; }
         } else if ty == EXT_SIGNATURE_ALGORITHMS {
             h.schemes = get_vec(e, m, 2);
             h.has_schemes = true;
+            if h.schemes.end == h.schemes.pos || (h.schemes.end - h.schemes.pos) % 2 != 0 { return h, false; }
         } else if ty == EXT_SERVER_NAME {
+            // One host_name, not empty; names of other types are skipped
+            // (RFC 6066 §3).
             var l = get_vec(e, m, 2);
-            let kind = get_u8(l, m);
-            h.sni = get_vec(l, m, 2);
-            if kind != 0 { return h, false; }
+            if l.end == l.pos { return h, false; }
+            var names = 0;
+            while l.pos < l.end {
+                let kind = get_u8(l, m);
+                let name = get_vec(l, m, 2);
+                if l.bad || name.end == name.pos { return h, false; }
+                if kind == 0 {
+                    names++;
+                    h.sni = name;
+                    if !host_name_ok(m[name.pos..name.end]) { h.alert = ALERT_ILLEGAL_PARAMETER; return h, false; }
+                }
+            }
+            if names > 1 { h.alert = ALERT_ILLEGAL_PARAMETER; return h, false; }
+        } else if ty == EXT_EARLY_DATA {
+            h.early_data = true;
         } else if ty == EXT_ALPN {
+            // A non-empty list of non-empty names (RFC 7301 §3.1).
             h.alpn = get_vec(e, m, 2);
+            if h.alpn.end == h.alpn.pos { return h, false; }
+            var l = h.alpn;
+            while l.pos < l.end {
+                let p = get_vec(l, m, 1);
+                if p.end == p.pos { l.bad = true; }
+            }
+            if l.bad { return h, false; }
         } else if ty == EXT_COOKIE {
             h.cookie = get_vec(e, m, 2);
         } else if ty == EXT_PSK_KEY_EXCHANGE_MODES {
@@ -1635,10 +1734,77 @@ fn parse_hello(m: const u8[:]) -> Hello, bool {
             h.binders_at = e.pos;
             h.psk_binders = get_vec(e, m, 2);
             h.has_psk = true;
+        } else {
+            e.pos = e.end;
         }
-        if e.bad { return h, false; }
+        if !done(e) { return h, false; }
     }
     return h, true;
+}
+
+// The client's signature schemes that this package has, in its order and
+// once each: however long its list, the ones that matter fit.
+fn take_peer_schemes(c: Conn&, m: const u8[:], schemes: Rd, known: const u16[:]) {
+    c.peer_schemes.clear();
+    var sl = schemes;
+    while sl.pos + 1 < sl.end {
+        let v = get_u16(sl, m) as! u16;
+        if offered_scheme(known, v) && !offered_scheme(c.peer_schemes, v) && c.peer_schemes.len < c.peer_schemes.cap {
+            c.peer_schemes.push(v);
+        }
+    }
+}
+
+// A digest of what a ClientHello after a HelloRetryRequest must repeat:
+// all but the extensions that may change (§4.1.2: key_share, early_data,
+// cookie, pre_shared_key; padding; and encrypted_client_hello, whose
+// payload is new), in their order. m is a ClientHello parse_hello took.
+fn hello_digest(m: const u8[:]) -> u8[>..] {
+    var b = Rd { pos: 4, end: m.len, bad: false };
+    let ver = get_u16(b, m);
+    let random = get_bytes(b, 32);
+    let sid = get_vec(b, m, 1);
+    let suites = get_vec(b, m, 2);
+    let comp = get_vec(b, m, 1);
+    var st = bignum::sha256_init();
+    bignum::sha256_update(st, m[4..b.pos]);
+    var exts = if b.pos == b.end { empty_rd() } else { get_vec(b, m, 2) };
+    while exts.pos < exts.end {
+        let at = exts.pos;
+        let ty = get_u16(exts, m);
+        let e = get_vec(exts, m, 2);
+        if ty != EXT_KEY_SHARE && ty != EXT_EARLY_DATA && ty != EXT_COOKIE && ty != EXT_PRE_SHARED_KEY &&
+           ty != EXT_PADDING && ty != EXT_ENCRYPTED_CLIENT_HELLO {
+            bignum::sha256_update(st, m[at..exts.pos]);
+        }
+    }
+    var out: u8[>..] = [];
+    out.append(bignum::sha256_final(st));
+    return out;
+}
+
+// Whether an SNI host_name is a DNS name (RFC 6066 §3): letters, digits,
+// '-', '_' and dots, with no trailing dot; no NUL, control or non-ASCII
+// bytes (a name beyond ASCII comes as an A-label).
+fn host_name_ok(n: const u8[:]) -> bool {
+    if n.len == 0 || n[n.len - 1] == '.' { return false; }
+    for b in n {
+        let ok = (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') ||
+                 b == '-' || b == '_' || b == '.';
+        if !ok { return false; }
+    }
+    return true;
+}
+
+// The highest version a client offers: supported_versions' highest that
+// this package knows, else legacy_version (at most TLS 1.3).
+fn client_max_version(h: const Hello&) -> i64 {
+    if h.has_versions {
+        if h.has_versions13 { return VERSION_TLS13; }
+        if h.has_versions12 { return VERSION_TLS12; }
+        return 0x0302;
+    }
+    return if h.version > VERSION_TLS13 { VERSION_TLS13 } else { h.version };
 }
 
 // The client's share for a group, as offsets, or an empty reader.
@@ -1805,8 +1971,13 @@ fn ech_retry_list(cfg: const ServerConfig&) -> u8[>..] {
 
 fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: u8[>..]&) -> i64 {
     let h, ok = parse_hello(m);
-    if !ok { return fail(c, ALERT_DECODE_ERROR, out); }
+    if !ok { return fail(c, if h.alert != 0 { h.alert } else { ALERT_DECODE_ERROR }, out); }
+    // A legacy_version below TLS 1.0 is no version this server has.
+    if h.version < 0x0301 { return fail(c, ALERT_PROTOCOL_VERSION, out); }
     let second = c.state == ST_WAIT_CH2;
+    // After a HelloRetryRequest, the same ClientHello but for what may
+    // change (§4.1.2).
+    if second && hello_digest(m) != c.ch1_digest[..] { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
     // The version: TLS 1.3 if both take it, else TLS 1.2 (named in
     // supported_versions, or by legacy_version without it), not after a
     // HelloRetryRequest or for an inner ClientHello.
@@ -1815,9 +1986,17 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
               cfg.min_version <= VERSION_TLS12 && cfg.max_version >= VERSION_TLS12 && cfg.suites12.len > 0;
     if !v13 {
         if v12 && !second && !c.ech_confirm { return server_client_hello12(c, cfg, m, h, out); }
+        // TLS_FALLBACK_SCSV from a client that could do better is told so,
+        // even when its version is one this server lacks (RFC 7507 §3).
+        if in_u16_list(m, h.suites, TLS_FALLBACK_SCSV) && client_max_version(h) < cfg.max_version {
+            return fail(c, ALERT_INAPPROPRIATE_FALLBACK, out);
+        }
         return fail(c, ALERT_PROTOCOL_VERSION, out);
     }
     c.version = VERSION_TLS13;
+    if !h.comp_null_only { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
+    // 0-RTT is never accepted: what the client sent of it is skipped.
+    c.skip_early = h.early_data && !second;
     if !h.has_groups || !h.has_shares || !h.has_schemes { return fail(c, ALERT_MISSING_EXTENSION, out); }
     if second && m[h.sid.pos..h.sid.end] != c.session_id[..] { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
     // The suite: the server's first that the client offers.
@@ -1844,6 +2023,8 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
         if fallback == 0 || second { return fail(c, if second { ALERT_ILLEGAL_PARAMETER } else { ALERT_HANDSHAKE_FAILURE }, out); }
         c.session_id.clear();
         c.session_id.append(m[h.sid.pos..h.sid.end]);
+        let d = hello_digest(m);
+        for i in 32 { c.ch1_digest[i] = d[i]; }
         c.group = fallback;
         c.th = transcript(s.hash);
         transcript_add(c.th, m);
@@ -1857,9 +2038,7 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
     }
     if second && group != c.group { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
     // The client's signature schemes, for CertificateVerify.
-    c.peer_schemes.clear();
-    var sl = h.schemes;
-    while sl.pos + 1 < sl.end && c.peer_schemes.len < c.peer_schemes.cap { c.peer_schemes.push(get_u16(sl, m) as! u16); }
+    take_peer_schemes(c, m, h.schemes, SIG_SCHEMES);
     let scheme = pick_scheme(cfg.key, c.peer_schemes);
     if select_alpn(c, cfg, h, m, out) != 0 { return -1; }
     c.sni.clear();
@@ -2022,7 +2201,9 @@ fn send_certificate(c: Conn&, cfg: const ServerConfig&, scheme: u16, out: u8[>..
     let cm, ok = certificate_message("", cfg.chain);
     if !ok { return fail(c, ALERT_INTERNAL_ERROR, out); }
     send_hs(c, cm, out);
-    send_hs(c, certificate_verify_message(cfg.key, scheme, true, transcript_hash(c.th)), out);
+    let cv, okv = certificate_verify_message(cfg.key, scheme, true, transcript_hash(c.th));
+    if !okv { return fail(c, ALERT_INTERNAL_ERROR, out); }
+    send_hs(c, cv, out);
     return 0;
 }
 
@@ -2129,6 +2310,7 @@ fn server_message(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: u8[>.
         return r;
     }
     if c.state == ST_WAIT_CLIENT_FINISHED && t == HS_FINISHED {
+        if m.len - 4 != c.suite.hash / 8 { return fail(c, ALERT_DECODE_ERROR, out); }
         if !finished_ok(c.suite.hash, c.sch.c_hs, transcript_hash(c.th), m[4..]) {
             return fail(c, ALERT_DECRYPT_ERROR, out);
         }
@@ -2155,7 +2337,8 @@ fn post_handshake(c: Conn&, m: const u8[:], out: u8[>..]&) -> i64 {
         return 0;
     }
     if m[0] == HS_KEY_UPDATE {
-        if m.len != 5 || m[4] > 1 { return fail(c, ALERT_DECODE_ERROR, out); }
+        if m.len != 5 { return fail(c, ALERT_DECODE_ERROR, out); }
+        if m[4] > 1 { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
         if c.hs.len != 0 { return fail(c, ALERT_UNEXPECTED_MESSAGE, out); }
         if c.is_server {
             set48(c.sch.c_ap, next_traffic_secret(c.suite.hash, c.sch.c_ap));
@@ -2181,23 +2364,62 @@ fn handle_record(c: Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&,
         if rec.len != 6 || rec[5] != 1 { return fail(c, ALERT_UNEXPECTED_MESSAGE, out); }
         // TLS 1.2's turns on the peer's keys, at the end of a flight.
         if c.version == VERSION_TLS12 { return change_cipher_spec12(c, out); }
-        // Middlebox compatibility: one byte 1, only during the handshake.
-        if c.state == ST_CONNECTED { return fail(c, ALERT_UNEXPECTED_MESSAGE, out); }
+        // Middlebox compatibility: one byte 1, once, only during the
+        // handshake (and not between a handshake message's fragments).
+        if c.state == ST_CONNECTED || c.ccs_seen || c.hs.len > 0 { return fail(c, ALERT_UNEXPECTED_MESSAGE, out); }
+        c.ccs_seen = true;
         return 0;
+    }
+    if c.read_protected && outer == CT_ALERT && c.version == VERSION_TLS13 && c.state != ST_CONNECTED &&
+       rec.len == 7 && rec[5] == ALERT_FATAL {
+        // A peer that could not process our flight may have no keys to
+        // protect its alert: a plaintext fatal alert ends the handshake.
+        c.alert = rec[6];
+        c.state = ST_FAILED;
+        return -1;
     }
     if c.read_protected {
         // TLS 1.2 protects every type as itself; TLS 1.3 hides it.
         if outer != CT_APPLICATION_DATA && c.version != VERSION_TLS12 { return fail(c, ALERT_UNEXPECTED_MESSAGE, out); }
         let t, p, a = open_record(c.read, rec);
-        if a != 0 { return fail(c, a, out); }
+        if a != 0 {
+            // 0-RTT data the server refused: records its handshake keys
+            // don't open are skipped, up to a limit (RFC 8446 §4.2.10).
+            if c.skip_early && a == ALERT_BAD_RECORD_MAC {
+                c.early_skipped += rec.len - 5;
+                if c.early_skipped <= MAX_EARLY_SKIP { return 0; }
+            }
+            return fail(c, a, out);
+        }
+        c.skip_early = false;
         ctype = t;
         payload = copy(p);
     } else {
+        // After a HelloRetryRequest the client's 0-RTT data, still under
+        // its early keys, comes before its second ClientHello.
+        if outer == CT_APPLICATION_DATA && c.skip_early && c.state == ST_WAIT_CH2 {
+            c.early_skipped += rec.len - 5;
+            if c.early_skipped <= MAX_EARLY_SKIP { return 0; }
+        }
         if outer == CT_APPLICATION_DATA { return fail(c, ALERT_UNEXPECTED_MESSAGE, out); }
         if rec.len - 5 > MAX_FRAGMENT { return fail(c, ALERT_RECORD_OVERFLOW, out); }
         payload.append(rec[5..]);
     }
+    // Handshake messages are not interleaved with other types (RFC 8446
+    // §5.1); a peer's alert still ends the connection as its own.
+    if ctype != CT_HANDSHAKE && ctype != CT_ALERT && c.hs.len > 0 { return fail(c, ALERT_UNEXPECTED_MESSAGE, out); }
+    // Records that carry nothing, many in a row, end the connection, as in
+    // Go: else a peer could keep it busy forever.
+    if payload.len == 0 || (ctype == CT_ALERT && payload.len == 2 && payload[0] == ALERT_WARNING &&
+                            payload[1] != ALERT_CLOSE_NOTIFY && c.version == VERSION_TLS12) {
+        c.useless++;
+        if c.useless > MAX_USELESS_RECORDS { return fail(c, ALERT_UNEXPECTED_MESSAGE, out); }
+    } else {
+        c.useless = 0;
+    }
     if ctype == CT_ALERT {
+        // An empty alert is no alert (RFC 8446 §5.1, §6).
+        if payload.len == 0 { return fail(c, ALERT_UNEXPECTED_MESSAGE, out); }
         if payload.len != 2 { return fail(c, ALERT_DECODE_ERROR, out); }
         // TLS 1.2's warnings, no_renegotiation say, are dropped, as Go does.
         if c.version == VERSION_TLS12 && payload[0] == ALERT_WARNING && payload[1] != ALERT_CLOSE_NOTIFY { return 0; }
@@ -2246,7 +2468,7 @@ fn feed(c: Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&, input: c
         var need = 5 - c.inbuf.len;
         if c.inbuf.len >= 5 {
             let n = record_length(c.inbuf, c.version == VERSION_TLS12);
-            if n < 0 { return fail(c, ALERT_DECODE_ERROR, out); }
+            if n < 0 { return fail(c, record_alert(c.inbuf, c.version == VERSION_TLS12), out); }
             let total = 5 + ((c.inbuf[3] as i64) << 8 | c.inbuf[4]);
             need = total - c.inbuf.len;
         }
@@ -2255,7 +2477,7 @@ fn feed(c: Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&, input: c
         off += take;
         if c.inbuf.len < 5 { continue; }
         let n = record_length(c.inbuf, c.version == VERSION_TLS12);
-        if n < 0 { return fail(c, ALERT_DECODE_ERROR, out); }
+        if n < 0 { return fail(c, record_alert(c.inbuf, c.version == VERSION_TLS12), out); }
         if n == 0 { continue; }
         var rec: u8[>..] = [];
         rec.append(c.inbuf);

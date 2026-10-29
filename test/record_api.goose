@@ -111,10 +111,18 @@ fn main() {
     check("empty record", tls::record_length(ok_hdr) == 5);
     let bad_type: u8[5] = [24, 3, 3, 0, 0];
     check("unknown type", tls::record_length(bad_type) == -1);
-    let bad_ver: u8[5] = [22, 3, 2, 0, 0];
-    check("tls 1.1", tls::record_length(bad_ver) == -1);
+    check("unknown type alert", tls::record_alert(bad_type) == tls::ALERT_UNEXPECTED_MESSAGE);
+    // Any minor version: 0x0300 in a first ClientHello, 0x0302 (ignored, RFC 8446 §5.1).
+    let ssl3_ver: u8[5] = [22, 3, 0, 0, 0];
+    check("record version 3.0", tls::record_length(ssl3_ver) == 5);
+    let tls11_ver: u8[5] = [22, 3, 2, 0, 0];
+    check("record version 3.2", tls::record_length(tls11_ver) == 5);
+    let bad_ver: u8[5] = [22, 4, 3, 0, 0];
+    check("major version 4", tls::record_length(bad_ver) == -1);
+    check("major version alert", tls::record_alert(bad_ver) == tls::ALERT_PROTOCOL_VERSION);
     let too_big: u8[5] = [22, 3, 3, 0x40, 1];
     check("plaintext over 2^14", tls::record_length(too_big) == -1);
+    check("overflow alert", tls::record_alert(too_big) == tls::ALERT_RECORD_OVERFLOW);
     let partial: u8[3] = [22, 3, 3];
     check("partial header", tls::record_length(partial) == 0);
 

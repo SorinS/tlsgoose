@@ -263,6 +263,8 @@ fn open_record(k: RecordKeys&, rec: const u8[:]) -> u8, u8[>..], u8 {
     };
     if !ok { out.clear(); return 0, out, ALERT_BAD_RECORD_MAC; }
     k.seq++;
+    // TLSInnerPlaintext, padding and all, is at most 2^14 + 1 bytes (§5.4).
+    if out.len > MAX_FRAGMENT + 1 { out.clear(); return 0, out, ALERT_RECORD_OVERFLOW; }
     // The content type is the last non-zero byte; zeros after it are padding.
     var end = out.len;
     while end > 0 && out[end - 1] == 0 { end--; }
@@ -274,19 +276,31 @@ fn open_record(k: RecordKeys&, rec: const u8[:]) -> u8, u8[>..], u8 {
 }
 
 // The length of the first whole record in buf: 0 while more bytes are
-// needed, -1 for a header no TLS 1.3 peer sends (an unknown type, a
-// version other than 0x0301 or 0x0303, or a length past the limit). With
-// tls12, any record may be as long as a TLS 1.2 ciphertext.
+// needed, -1 for a header no peer sends (an unknown type, a major version
+// other than 3, or a length past the limit; record_alert says which).
+// The minor version is not checked: a first ClientHello's record may say
+// 0x0300, and TLS 1.3 ignores it (RFC 8446 §5.1), as Go does until the
+// version is agreed. With tls12, any record may be as long as a TLS 1.2
+// ciphertext.
 fn record_length(buf: const u8[:], tls12: bool = false) -> i64 {
     if buf.len < 5 { return 0; }
-    let t = buf[0];
-    if t < CT_CHANGE_CIPHER_SPEC || t > CT_APPLICATION_DATA { return -1; }
-    if buf[1] != 3 || (buf[2] != 1 && buf[2] != 3) { return -1; }
+    if record_alert(buf, tls12) != 0 { return -1; }
     let n = (buf[3] as i64) << 8 | buf[4];
-    if tls12 { if n > MAX_CIPHERTEXT12 { return -1; } }
-    else if n > MAX_CIPHERTEXT || (t != CT_APPLICATION_DATA && n > MAX_FRAGMENT) { return -1; }
     if buf.len < 5 + n { return 0; }
     return 5 + n;
+}
+
+// The alert for a header record_length refuses, 0 for one it takes:
+// unexpected_message for an unknown type, protocol_version for a major
+// version other than 3, record_overflow for a length past the limit.
+fn record_alert(buf: const u8[:], tls12: bool = false) -> u8 {
+    let t = buf[0];
+    if t < CT_CHANGE_CIPHER_SPEC || t > CT_APPLICATION_DATA { return ALERT_UNEXPECTED_MESSAGE; }
+    if buf[1] != 3 { return ALERT_PROTOCOL_VERSION; }
+    let n = (buf[3] as i64) << 8 | buf[4];
+    if tls12 { if n > MAX_CIPHERTEXT12 { return ALERT_RECORD_OVERFLOW; } }
+    else if n > MAX_CIPHERTEXT || (t != CT_APPLICATION_DATA && n > MAX_FRAGMENT) { return ALERT_RECORD_OVERFLOW; }
+    return 0;
 }
 
 // A handshake message: type, 24-bit length, body.

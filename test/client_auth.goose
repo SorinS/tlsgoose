@@ -206,13 +206,14 @@ fn main() {
     sc_req_unnamed.client_cas = x509::new_pool();
     let o14 = connect(foreign, sc_req_unnamed);
     check("no CAs named: sent", o14.ok && o14.peer == field("server", "p256", 2));
-    // A key that is not the certificate's: CertificateVerify fails.
+    // A key that is not the certificate's: its CertificateVerify's scheme
+    // does not fit the certificate's key (illegal_parameter, as in Go).
     var mismatched = client_cfg();
     check("mismatched key", tls::set_client_certificate(mismatched, field("client", "p256", 2),
                                                         field("client", "ed25519", 3)));
     let sc14 = server_cfg(tls::REQUEST_CLIENT_CERT);
     let o15 = connect(mismatched, sc14);
-    check("key not the certificate's", !o15.ok && o15.server_alert == tls::ALERT_DECRYPT_ERROR);
+    check("key not the certificate's", !o15.ok && o15.server_alert == tls::ALERT_ILLEGAL_PARAMETER);
     var junk = client_cfg();
     check("junk key refused", !tls::set_client_certificate(junk, field("client", "p256", 2), "junk"));
 
