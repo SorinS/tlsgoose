@@ -122,7 +122,12 @@ fn handshake_alert(cc: const tls::ClientConfig&, sc: const tls::ServerConfig&) -
     return c.alert, s.alert;
 }
 
-fn main() {
+// The checks come in parts, each a function of its own, so that a part's
+// connections (large values) leave the stack when it returns: main
+// holding them all overflowed Linux's 8 MB stack.
+
+// Every key type, suite and group.
+fn suites_and_groups() {
     let kinds = ["ed25519", "p256", "p384", "p521", "rsa", "mldsa44", "mldsa65", "mldsa87"];
     let suites: u16[4] = [tls::TLS_AES_128_GCM_SHA256, tls::TLS_AES_256_GCM_SHA384, tls::TLS_CHACHA20_POLY1305_SHA256,
                           tls::TLS_AES_128_GCM_SHA256];
@@ -138,6 +143,10 @@ fn main() {
             let ok = handshake_ok(kind, cc, sc);
         }
     }
+}
+
+// The other ML-KEM groups.
+fn mlkem_groups() {
     // The other ML-KEM groups, each alone on both sides, and a hybrid's
     // ECDH share taken by a server without ML-KEM.
     let pq: u16[3] = [tls::GROUP_SECP256R1MLKEM768, tls::GROUP_SECP384R1MLKEM1024, tls::GROUP_MLKEM1024];
@@ -170,6 +179,10 @@ fn main() {
         pump(cf, cg, sff, sf, tq, caq, saq);
         check("ecdh beside the hybrid", tls::connected(cf) && cf.group == classic[gi] && !cf.hrr);
     }
+}
+
+// The hybrid defaults and retries.
+fn hybrid_defaults() {
     // The defaults offer the NIST hybrids; a server preferring one takes it
     // through a retry.
     var cn = client_cfg();
@@ -227,7 +240,10 @@ fn main() {
     tls::client_start(c2h, cr, ts);
     pump(c2h, cr, s2h, sh, ts, ca0, sa0);
     check("hrr to the hybrid", tls::connected(c2h) && c2h.hrr && c2h.group == tls::GROUP_X25519MLKEM768);
+}
 
+// A HelloRetryRequest and ALPN.
+fn hrr_and_alpn() {
     // HelloRetryRequest: the client's share is X25519, the server only
     // takes P-256.
     var cc = client_cfg();
@@ -263,7 +279,10 @@ fn main() {
     tls::add_alpn(sn.alpn, "spdy/3");
     let ca1, sa1 = handshake_alert(ca, sn);
     check("alpn mismatch", sa1 == tls::ALERT_NO_APPLICATION_PROTOCOL);
+}
 
+// Failures the client must catch, and roots.
+fn client_failures() {
     // Failures the client must catch.
     var wrong_root = client_cfg();
     wrong_root.roots = x509::new_pool();
@@ -327,7 +346,13 @@ fn main() {
     let srv_lax = server_cfg("p256");
     let a6, b6 = handshake_alert(lax, srv_lax);
     check("verify off", a6 == 0 && b6 == 0);
+}
 
+// Changed records, and bytes one at a time.
+fn records() {
+    var to_server: u8[>..] = [];
+    var capp: u8[>..] = [];
+    var sapp: u8[>..] = [];
     // A changed record ends the connection with bad_record_mac.
     var cc3 = client_cfg();
     let sc3 = server_cfg("p384");
@@ -355,7 +380,15 @@ fn main() {
     for i in reply.len { let rr = tls::client_feed(c4, cc4, reply[i..i + 1], fin, capp); }
     let rr = tls::server_feed(s4, sc4, fin, reply, sapp);
     check("byte at a time", tls::connected(c4) && tls::connected(s4));
+}
 
+fn main() {
+    suites_and_groups();
+    mlkem_groups();
+    hybrid_defaults();
+    hrr_and_alpn();
+    client_failures();
+    records();
     print("handshake: ", checks, " checks, ", failures, " failed");
     assert(failures == 0);
 }
