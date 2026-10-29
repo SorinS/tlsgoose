@@ -362,7 +362,7 @@ def failed_names(text):
 
 
 def run_one(args, tf, port, name, extra, logdir, tag, timeout):
-    cmd = [args.python, os.path.join(tf, "scripts", name), "-h", "localhost", "-p", str(port), *extra]
+    cmd = [args.python, os.path.join(tf, "scripts", name), "-h", "127.0.0.1", "-p", str(port), *extra]
     env = dict(os.environ, PYTHONPATH=tf)
     t0 = time.time()
     try:
@@ -423,7 +423,7 @@ def run(args):
         srv_log = open(os.path.join(args.out, f"{cname}.server.log"), "w")
         srv = subprocess.Popen(srv_cmd, stdout=srv_log, stderr=subprocess.STDOUT)
         try:
-            wait_open("localhost", port, srv)
+            wait_open("127.0.0.1", port, srv)
             logdir = os.path.join(args.out, cname)
             os.makedirs(logdir, exist_ok=True)
             print(f"== {cname}: {len(scripts)} scripts on port {port}", flush=True)
@@ -480,7 +480,7 @@ def main():
     s = sub.add_parser("server")
     s.add_argument("--peer", help="a built tools/peer.goose (built if not given)")
     s.add_argument("--goose", default=default_goose())
-    s.add_argument("--host", default="localhost")
+    s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=4433)
     s.add_argument("--cert", default=os.path.join(GOOSE_DIR, "tlsfuzzer.git", "tests", "serverX509Cert.pem"))
     s.add_argument("--key", default=os.path.join(GOOSE_DIR, "tlsfuzzer.git", "tests", "serverX509Key.pem"))
