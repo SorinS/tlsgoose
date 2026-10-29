@@ -326,7 +326,11 @@ python3 scripts/gen_handshake.py        # remake vectors/hs_certs.txt
 python3 scripts/openssl_interop.py      # recapture vectors of OpenSSL's connections
 python3 scripts/rfc8448.py              # re-extract RFC 8448's trace (fetches the RFC)
 tools/gointerop.sh <mode> -flags ...    # Go's side by hand (gointerop.sh <mode> -h lists the flags)
+python3 scripts/bench_openssl.py [prefix]   # handshakes and throughput against OpenSSL
 ```
+
+[Benchmarks_OpenSSL.md](Benchmarks_OpenSSL.md) has the figures, how they
+are measured, and the primitives' speeds from bigmongoose.git.
 
 They take the compiler from `--goose`, `$GOOSE`, `goose` on PATH or
 `../goose.git/build/goose`, and asn1goose.git, bigmongoose.git and

@@ -6,5 +6,6 @@ test/*
 !test/expected/
 !test/vectors/
 *.c
+!tools/bench_openssl.c
 __pycache__/
 __pycache__/
