@@ -383,6 +383,13 @@ def failed_names(text):
     return seen
 
 
+def samples(tf, name):
+    # Many scripts run a random sample of their conversations (num_limit,
+    # set by -n; 0 is all of them), so a rare case is met in some runs only.
+    app = os.path.join(tf, "tlsfuzzer", "_apps", name[:-3].replace("-", "_") + ".py")
+    return os.path.exists(app) and re.search(r"^\s*num_limit = \d+", open(app).read(), re.M) is not None
+
+
 def run_one(args, tf, port, name, extra, logdir, tag, timeout):
     cmd = [args.python, os.path.join(tf, "scripts", name), "-h", "127.0.0.1", "-p", str(port), *extra]
     env = dict(os.environ, PYTHONPATH=tf)
@@ -420,6 +427,8 @@ def run(args):
             scripts = cfg["scripts"]
         if args.only:
             scripts = [s for s in scripts if args.only in s[0]]
+        if args.all_conversations:
+            scripts = [(n, extra + ["-n", "0"] if samples(tf, n) else extra) for n, extra in scripts]
         if not scripts:
             continue
         port = args.port + ci
@@ -520,6 +529,8 @@ def main():
     r.add_argument("-j", "--jobs", type=int, default=4)
     r.add_argument("--timeout", type=int, default=900, help="seconds for each script")
     r.add_argument("--only", default="", help="only the scripts whose name has this")
+    r.add_argument("--all-conversations", action="store_true",
+                   help="every conversation of the scripts that otherwise run a random sample (-n 0)")
     r.add_argument("configs", nargs="*", help=f"some of: {', '.join(CONFIGS)} (all)")
     args = ap.parse_args()
     if args.cmd == "server":
