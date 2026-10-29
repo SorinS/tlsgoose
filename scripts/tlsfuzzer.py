@@ -323,6 +323,11 @@ for _n, _a in CONFIGS["rsa-client-auth"]["scripts"]:
 ARGS = {
     # Go's limit on records that carry nothing, not OpenSSL's 4.
     "test-ssl-death-alert.py": ["--alerts", "16"],
+    # Its "unassigned" ids include extensions this server implements
+    # (ec_point_formats, extended_master_secret, session_ticket,
+    # renegotiation_info, ECH and ech_outer_extensions): sent malformed, as
+    # its random ranges sometimes do, they rightly get decode_error.
+    "test-tls13-large-number-of-extensions.py": [a for e in (11, 23, 35, 0xff01, 0xfe0d, 0xfd00) for a in ("--exc", str(e))],
 }
 
 SUMMARY = re.compile(r"^(TOTAL|SKIP|PASS|XFAIL|FAIL|XPASS):\s*(\d+)", re.M)
