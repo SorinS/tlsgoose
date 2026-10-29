@@ -1,7 +1,9 @@
 // tls.record's checks and edge cases: headers record_length refuses,
 // records open_record refuses (each with its alert), padding, records with
 // no content type, fragmenting long data, the nonce for large sequence
-// numbers, KeyUpdate, and the HelloRetryRequest transcript.
+// numbers, KeyUpdate, and the HelloRetryRequest transcript. TLS 1.2's CBC
+// records at their boundaries: every short length, the longest padding,
+// and padding or MACs that are wrong.
 import std;
 import tls from "..";
 import bignum from "../../bigmongoose.git";
@@ -20,6 +22,92 @@ fn check(what: const u8[:], ok: bool) {
 
 fn alert_of(k: tls::RecordKeys&, rec: const u8[:]) -> u8 {
     let t, p, a = tls::open_record(k, rec);
+    return a;
+}
+
+// A CBC record built by hand: data, its MAC (changed when bad_mac), then
+// padlen + 1 bytes of padlen (the last but one changed when bad_pad).
+fn cbc_record(k: const tls::RecordKeys&, data: const u8[:], padlen: i64, bad_mac: bool, bad_pad: bool) -> u8[>..] {
+    var body: u8[>..] = [];
+    body.append(data);
+    var mac = tls::mac12(k, 23, data);
+    if bad_mac { mac[0] ^= 1; }
+    body.append(mac);
+    for i in padlen + 1 { body.push(padlen as! u8); }
+    if bad_pad && padlen > 0 { body[body.len - 2] ^= 1; }
+    var iv: u8[16] = [0; 16];
+    for i in 16 { iv[i] = (i * 13 + 5) as! u8; }
+    bignum::cbc_encrypt(k.gcm.aes, iv, body);
+    var rec: u8[>..] = [];
+    rec.append(tls::header(23, 0x0303, 16 + body.len));
+    rec.append(iv);
+    rec.append(body);
+    return rec;
+}
+
+fn cbc_records() {
+    let ids: u16[3] = [tls::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA, tls::TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+                       tls::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256];
+    for id in ids {
+        let st, ok = tls::suite(id);
+        check("cbc suite", ok);
+        var key: u8[>..] = [];
+        key.resize(st.key_len, 0x21);
+        var mac_key: u8[>..] = [];
+        mac_key.resize(st.mac / 8, 0x42);
+        let none: u8[0] = [];
+        var w = tls::record_keys12(st, key, mac_key, none);
+        var rd = tls::record_keys12(st, key, mac_key, none);
+        // Every length from 0 to 80 and around 256, sealed and opened.
+        var all = true;
+        for n in 0..300 {
+            if n > 80 && (n < 240 || n > 272) { continue; }
+            var data: u8[>..] = [];
+            for i in n { data.push((i * 7 + n) as! u8); }
+            let rec = tls::seal_record12(w, 23, data);
+            let t, p, a = tls::open_record12(rd, rec);
+            if a != 0 || t != 23 || p[..] != data[..] { all = false; }
+        }
+        check("cbc: short and boundary lengths round trip", all);
+        // The longest padding (up to 256 bytes), with a right MAC: taken; and at
+        // each length of padding, a wrong padding byte or MAC is refused.
+        for n in [0, 1, 15, 16, 17, 100] {
+            var data: u8[>..] = [];
+            for i in n { data.push((i + 3) as! u8); }
+            // The padding lengths that fit: the least, the next, the most.
+            let base = (16 - (n + st.mac / 8 + 1) % 16) % 16;
+            let pads: i64[3] = [base, base + 16, base + 16 * ((255 - base) / 16)];
+            for padlen in pads {
+                let good = cbc_record(rd, data, padlen, false, false);
+                let t, p, a = tls::open_record12(rd, good);
+                check("cbc: hand-made record opens", a == 0 && p[..] == data[..]);
+                let bp = cbc_record(rd, data, padlen, false, true);
+                if padlen > 0 { check("cbc: bad padding refused", alert_of12(rd, bp) == tls::ALERT_BAD_RECORD_MAC); }
+                let bm = cbc_record(rd, data, padlen, true, false);
+                check("cbc: bad MAC refused", alert_of12(rd, bm) == tls::ALERT_BAD_RECORD_MAC);
+            }
+        }
+        // A padding length past the record.
+        var data: u8[>..] = [];
+        for i in 12 { data.push(i as! u8); }
+        let ml = st.mac / 8;
+        var body: u8[>..] = [];
+        body.append(data);
+        body.append(tls::mac12(rd, 23, data));
+        while (body.len + 1) % 16 != 0 { body.push(200); }
+        body.push(200);
+        var iv: u8[16] = [9; 16];
+        bignum::cbc_encrypt(rd.gcm.aes, iv, body);
+        var rec: u8[>..] = [];
+        rec.append(tls::header(23, 0x0303, 16 + body.len));
+        rec.append(iv);
+        rec.append(body);
+        check("cbc: padding longer than the record refused", alert_of12(rd, rec) == tls::ALERT_BAD_RECORD_MAC && ml > 0);
+    }
+}
+
+fn alert_of12(k: tls::RecordKeys&, rec: const u8[:]) -> u8 {
+    let t, p, a = tls::open_record12(k, rec);
     return a;
 }
 
@@ -143,6 +231,7 @@ fn main() {
     let e2 = tls::export_keying_material(256, secret[..32], "EXPORTER-test", "ctx", 32);
     check("exporter", e1.len == 32 && e1 != e2);
 
+    cbc_records();
     print("record api: ", checks, " checks, ", failures, " failed");
     assert(failures == 0);
 }

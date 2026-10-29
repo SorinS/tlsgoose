@@ -1403,15 +1403,13 @@ fn check_server_chain(c: Conn&, cfg: const ClientConfig&, out: u8[>..]&) -> i64 
 }
 
 // Whether a certificate's keyUsage, when it has one, lets its key sign
-// (RFC 5280 §4.2.1.3): TLS 1.3 requires digitalSignature (§4.4.2.2).
+// (RFC 5280 §4.2.1.3): digitalSignature, as TLS 1.3 requires (RFC 8446
+// §4.4.2.2) and TLS 1.2 for every signing key, RSA's included (RFC 5246
+// §7.4.2, §7.4.6). OpenSSL lets an RSA key sign in TLS 1.2 without it;
+// this does not.
 fn usage_signs(leaf: const x509::Cert&) -> bool {
     !leaf.has_key_usage || leaf.key_usage & x509::KU_DIGITAL_SIGNATURE != 0
 }
-
-// TLS 1.2's rule, as OpenSSL's: RSA keys are not held to it, since RSA
-// certificates were long issued for keyEncipherment alone and signed
-// ECDHE_RSA anyway; every other key must allow signing.
-fn usage_signs12(leaf: const x509::Cert&) -> bool { leaf.key_type == x509::KEY_RSA || usage_signs(leaf) }
 
 // The peer's CertificateVerify, by the leaf of c.chain over the transcript
 // so far (§4.4.3); 0, or -1 after failing.

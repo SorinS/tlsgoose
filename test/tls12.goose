@@ -478,6 +478,16 @@ fn usage_leaf(root: const u8[:], root_key: const x509::PrivateKey&, key: const x
     return der;
 }
 
+// A client certificate (clientAuth) under root, on key, with that keyUsage.
+fn client_leaf(root: const u8[:], root_key: const x509::PrivateKey&, key: const x509::PrivateKey&, usage: u32) -> u8[>..] {
+    var t, ok = x509::template("CN=goose client", NOW - 3600, NOW + 86400);
+    t.key_usage = usage;
+    t.ext_key_usage = x509::EKU_CLIENT_AUTH;
+    let der, e = x509::create_certificate(t, x509::marshal_public_key(key), root, root_key);
+    check("client leaf made", ok && e == x509::OK);
+    return der;
+}
+
 fn usage_server(chain: const u8[:], key: const x509::PrivateKey&, suite12: u16) -> tls::ServerConfig {
     var sc, ok = tls::server_config(chain, x509::marshal_pkcs8(key));
     check("server key", ok);
@@ -490,9 +500,9 @@ fn usage_server(chain: const u8[:], key: const x509::PrivateKey&, suite12: u16) 
 }
 
 // keyUsage, when a certificate has it, must allow what TLS does with the
-// key: signing in TLS 1.3 (digitalSignature, RFC 8446 §4.4.2.2), and in
-// TLS 1.2 for every key but RSA (as OpenSSL); encrypting to it in TLS
-// 1.2's RSA key exchange (keyEncipherment).
+// key: signing (digitalSignature) in TLS 1.3 (RFC 8446 §4.4.2.2) and in
+// TLS 1.2, RSA keys included (RFC 5246 §7.4.2, §7.4.6); encrypting to it in
+// TLS 1.2's RSA key exchange (keyEncipherment).
 fn key_usage() {
     let root_key = x509::generate_key(x509::KEY_ED25519);
     var rt, okr = x509::template("CN=Goose Usage Root", NOW - 3600, NOW + 86400);
@@ -521,7 +531,25 @@ fn key_usage() {
     let o3 = connect(cc13, s_enc);
     check("1.3 RSA, keyEncipherment only: refused", !o3.ok && o3.client_alert == tls::ALERT_BAD_CERTIFICATE);
     let s_ecdhe = usage_server(rsa_enc, rk, tls::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256);
-    check("1.2 ECDHE_RSA, keyEncipherment only: taken", connect(cc12, s_ecdhe).ok);
+    let o5 = connect(cc12, s_ecdhe);
+    check("1.2 ECDHE_RSA, keyEncipherment only: refused", !o5.ok && o5.client_alert == tls::ALERT_BAD_CERTIFICATE);
+    let s_ecdhe_sign = usage_server(rsa_sign, rk, tls::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256);
+    check("1.2 ECDHE_RSA, digitalSignature", connect(cc12, s_ecdhe_sign).ok);
+    // A client certificate on an RSA key, checked by the server: it signs
+    // CertificateVerify, so it needs digitalSignature too.
+    var sca = usage_server(rsa_sign, rk, tls::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256);
+    sca.client_auth = tls::REQUIRE_AND_VERIFY_CLIENT_CERT;
+    check("client CA", x509::pool_add(sca.client_cas, root));
+    var cc_enc = copy(cc12);
+    check("rsa client cert", tls::set_client_certificate(cc_enc, client_leaf(root, root_key, rk, x509::KU_KEY_ENCIPHERMENT),
+                                                          x509::marshal_pkcs8(rk)));
+    let o6 = connect(cc_enc, sca);
+    check("1.2 RSA client certificate, keyEncipherment only: refused", !o6.ok && o6.server_alert == tls::ALERT_BAD_CERTIFICATE);
+    var cc_sig = copy(cc12);
+    check("rsa client cert", tls::set_client_certificate(cc_sig, client_leaf(root, root_key, rk, x509::KU_DIGITAL_SIGNATURE),
+                                                          x509::marshal_pkcs8(rk)));
+    let o7 = connect(cc_sig, sca);
+    check("1.2 RSA client certificate, digitalSignature", o7.ok && o7.verified);
     var cck = copy(cc12);
     cck.suites12.clear();
     cck.suites12.push(tls::TLS_RSA_WITH_AES_128_GCM_SHA256);

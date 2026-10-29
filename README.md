@@ -83,7 +83,7 @@ EC, Ed25519, ML-DSA), SEC 1 or PKCS #1 DER.
 |---|---|---|
 | Suites | all three, in `cfg.suites` order | its own order of preference |
 | Key exchange | The post-quantum X25519MLKEM768 (the default), SecP256r1MLKEM768 and SecP384r1MLKEM1024 hybrids and MLKEM1024 alone; X25519, P-256, P-384, P-521. The defaults are Go's: everything but MLKEM1024. The client sends a share for the first of `cfg.groups` (plus, beside a hybrid, a share of its ECDH part on the same key, as Go does) and reaches the others through HelloRetryRequest | its first group the client has a share for, else a HelloRetryRequest for its first group the client supports |
-| Certificates | checked by `x509::verify_with_roots`: chain to `cfg.roots`, or to the system's roots when `cfg.system_roots`, name `cfg.server_name`, time `cfg.now` (0 for now); `cfg.verify = false` skips it. Whatever `verify`, a leaf with keyUsage must allow what TLS does with it (digitalSignature to sign in TLS 1.3, and in TLS 1.2 but for RSA keys, as OpenSSL; keyEncipherment for RSA key exchange) | sends `cfg.chain`, signs CertificateVerify with RSA-PSS, ECDSA (P-256, P-384, P-521), Ed25519 or ML-DSA as its key and the client allow |
+| Certificates | checked by `x509::verify_with_roots`: chain to `cfg.roots`, or to the system's roots when `cfg.system_roots`, name `cfg.server_name`, time `cfg.now` (0 for now); `cfg.verify = false` skips it. Whatever `verify`, a leaf with keyUsage must allow what TLS does with it (digitalSignature to sign, in TLS 1.3 and 1.2 alike and RSA keys included, as RFC 5246 §7.4.2 requires and stricter than OpenSSL; keyEncipherment for RSA key exchange) | sends `cfg.chain`, signs CertificateVerify with RSA-PSS, ECDSA (P-256, P-384, P-521), Ed25519 or ML-DSA as its key and the client allow |
 | CertificateVerify | ML-DSA-44/65/87 (draft-ietf-tls-mldsa, offered first, as Go does), RSA-PSS, RSA PKCS #1 v1.5, ECDSA P-256/P-384/P-521, Ed25519 | |
 | Client certificates | sends `cfg.cert_chain` (set with `tls::set_client_certificate(cfg, chain_der, key_der)`) when asked, if its key signs with a scheme the server takes and, if the server names CAs, one of its certificates was issued by one of them; otherwise an empty Certificate | asks per `cfg.client_auth`, Go's modes: `NO_CLIENT_CERT` (the default), `REQUEST_CLIENT_CERT`, `REQUIRE_ANY_CLIENT_CERT`, `VERIFY_CLIENT_CERT_IF_GIVEN`, `REQUIRE_AND_VERIFY_CLIENT_CERT`; names the CAs of `cfg.client_cas` and checks chains against them (the system's roots when empty, as Go) for client authentication; `tls::peer_certificates(c)`, `tls::peer_verified(c)` |
 | ALPN | `cfg.alpn` offered | its first protocol the client offered, or `no_application_protocol` |
@@ -371,7 +371,10 @@ library only).
   bytes exactly.
 - `record_api`: refused headers and records with their alerts, padding,
   typeless records, fragmenting, nonces, KeyUpdate, the HelloRetryRequest
-  transcript, exporters.
+  transcript, exporters; TLS 1.2 CBC records (SHA-1 and SHA-256 MACs):
+  every length to 80 and around 256 sealed and opened, hand-made records
+  with the least to the most padding (256 bytes) opened, and each with a
+  wrong padding byte or MAC, or a padding length past the record, refused.
 
 - `handshake`: this package's client against its server in memory, for
   every server key type (ML-DSA included) with each suite and group. Each run includes
@@ -437,8 +440,9 @@ library only).
     nor one whose roots were replaced; a client certificate's ticket is
     not resumed under other client CAs;
   - keyUsage: digitalSignature required for TLS 1.3's CertificateVerify
-    and TLS 1.2's ECDSA and EdDSA signatures, keyEncipherment for RSA key
-    exchange; an RSA key may sign ECDHE_RSA without it, as in OpenSSL.
+    and every TLS 1.2 signature, RSA's included (ECDHE_RSA, and an RSA
+    client certificate: stricter than OpenSSL, as RFC 5246 asks), and
+    keyEncipherment for RSA key exchange.
 
 `scripts/live_interop.py` runs live connections against OpenSSL (179
 cases). It builds `tools/peer.goose`, a peer driven over stdin and stdout,

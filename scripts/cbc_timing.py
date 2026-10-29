@@ -43,6 +43,11 @@ def main():
         if p.returncode != 0:
             sys.stderr.write(p.stdout + p.stderr)
             sys.exit(1)
+        # On Linux, one core: moved between cores (and their SMT siblings),
+        # constant-time code measured |t| above 10 at random on an idle
+        # i7-8700; pinned, it did not. macOS has no affinity call.
+        if hasattr(os, "sched_setaffinity"):
+            os.sched_setaffinity(0, {max(os.sched_getaffinity(0))})
         sys.exit(subprocess.run([exe, str(args.scale)]).returncode)
 
 

@@ -304,7 +304,7 @@ fn client_server_key_exchange12(c: Conn&, cfg: const ClientConfig&, m: const u8[
     signed.append(c.peer_random);
     signed.append(m[4..params_end]);
     let leaf, okl = peer_leaf(c);
-    if okl && !usage_signs12(leaf) {
+    if okl && !usage_signs(leaf) {
         c.error = x509::ERR_KEY_USAGE;
         return fail(c, ALERT_BAD_CERTIFICATE, out);
     }
@@ -755,7 +755,7 @@ fn server_certificate_verify12(c: Conn&, m: const u8[:], out: u8[>..]&) -> i64 {
     if !offered_scheme(SIG_SCHEMES12, scheme as! u16) { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
     if c.log_over { return fail(c, ALERT_INTERNAL_ERROR, out); }
     let leaf, okl = peer_leaf(c);
-    if okl && !usage_signs12(leaf) {
+    if okl && !usage_signs(leaf) {
         c.error = x509::ERR_KEY_USAGE;
         return fail(c, ALERT_BAD_CERTIFICATE, out);
     }
