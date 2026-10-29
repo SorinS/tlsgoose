@@ -132,10 +132,28 @@ fn cbc_padding(p: const u8[:]) -> i64, u32 {
     return remove, mask;
 }
 
+// The ml-byte MAC at p[dlen..], read without an address that depends on
+// dlen: every byte where it could be (the last 256 + ml) is read, and
+// kept where it lines up.
+fn cbc_mac_at(p: const u8[:], dlen: i64, ml: i64) -> u8[>..] {
+    var mac: u8[>..] = [];
+    mac.resize(ml, 0);
+    for i in ::max(0, p.len - ml - 256)..p.len {
+        let b: u32 = p[i];
+        for j in ml {
+            let m = bignum::ct_mask(bignum::ct_eq_u32(i as! u32, (dlen + j) as! u32));
+            mac[j] |= (b & m) as! u8;
+        }
+    }
+    return mac;
+}
+
 // Opens a TLS 1.2 record: its type, the plaintext, and the alert when it
 // fails (0 for none). For CBC, a bad padding and a bad MAC look the same,
-// and the MAC is computed over the same length either way, with the
-// padding hashed after it, as Go does against Lucky13.
+// and cost the same, against Lucky13 (AlFardan and Paterson, 2013): the
+// MAC is computed in constant time over the length the padding gives
+// (bignum::hmac_prefix_ct; the padding is at most 256 bytes, so that
+// length is one of the last 256), and read in constant time.
 fn open_record12(k: RecordKeys&, rec: const u8[:]) -> u8, u8[>..], u8 {
     var out: u8[>..] = [];
     if rec.len < 5 || rec[1] != 3 || rec[2] != 3 { return 0, out, ALERT_PROTOCOL_VERSION; }
@@ -152,9 +170,11 @@ fn open_record12(k: RecordKeys&, rec: const u8[:]) -> u8, u8[>..], u8 {
         var dlen = out.len - ml - remove;
         let neg = ((dlen as! u64) >> 63) as! u32;
         dlen = bignum::ct_select_u32(bignum::ct_mask(neg), 0, dlen as! u32);
-        let want = mac12(k, ctype, out[..dlen]);
-        let extra = bignum::hash_bits(k.suite.mac, out[dlen + ml..]);
-        let ok = bignum::ct_eq_bytes(want, out[dlen..dlen + ml]) & good & 1;
+        let dmax = out.len - ml;
+        let want = bignum::hmac_prefix_ct(k.suite.mac, k.mac_key, aad12(k, ctype, dlen), out[..dmax], dlen,
+                                          ::max(0, dmax - 256));
+        let got = cbc_mac_at(out, dlen, ml);
+        let ok = bignum::ct_eq_bytes(want, got) & good & 1;
         if ok != 1 { out.clear(); return 0, out, ALERT_BAD_RECORD_MAC; }
         out.resize(dlen);
     } else {

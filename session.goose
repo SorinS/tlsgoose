@@ -19,16 +19,20 @@ let MAX_TICKET_LIFETIME: i64 = 604800;
 // 1.2's master secret, and whether it is an extended one), the ticket and
 // its age_add, when it arrived (milliseconds since 1970) and for how long
 // it is good, the server name and ALPN protocol of the connection that got
-// it, and its certificate's notAfter (0 when unchecked).
+// it, its certificate's notAfter (0 when unchecked), whether its chain was
+// verified, and the chain (DER concatenated, leaf first), so that a client
+// that verifies resumes only on a chain that its roots accept today (as
+// Go does).
 struct Session {
     version: u16, suite: u16, psk: u8[..48], ems: bool, age_add: u32, lifetime: i64, received_ms: i64,
     server_name: u8[..255], alpn: u8[..255], not_after: i64, max_early_data: u32,
+    verified: bool, chain: u8[..12288],
     ticket: u8[..16384],
 }
 
 fn no_session() -> Session {
     Session { version: VERSION_TLS13, suite: 0, psk: [], ems: false, age_add: 0, lifetime: 0, received_ms: 0, server_name: [], alpn: [],
-              not_after: 0, max_early_data: 0, ticket: [] }
+              not_after: 0, max_early_data: 0, verified: false, chain: [], ticket: [] }
 }
 
 // Whether a session may be offered at `now_ms` to `server_name`: not
@@ -81,7 +85,7 @@ fn sess_get_vec(r: SessRd&, b: const u8[:], n: i64, max: i64) -> u8[>..] {
 // ResumptionState); `parse_session` reads them back.
 fn session_bytes(s: const Session&) -> u8[>..] {
     var out: u8[>..] = [];
-    out.push(2);                                    // format version
+    out.push(3);                                    // format version
     sess_put(out, s.version, 2);
     sess_put(out, s.suite, 2);
     sess_vec(out, s.psk, 1);
@@ -93,6 +97,8 @@ fn session_bytes(s: const Session&) -> u8[>..] {
     sess_vec(out, s.alpn, 1);
     sess_put(out, s.not_after as! u64, 8);
     sess_put(out, s.max_early_data, 4);
+    sess_put(out, if s.verified { 1 } else { 0 }, 1);
+    sess_vec(out, s.chain, 2);
     sess_vec(out, s.ticket, 2);
     return out;
 }
@@ -101,12 +107,12 @@ fn parse_session(b: const u8[:]) -> Session, bool {
     var s = no_session();
     var r = SessRd { pos: 0, bad: false };
     let format = sess_get(r, b, 1);
-    if format != 1 && format != 2 { return s, false; }
-    if format == 2 { s.version = sess_get(r, b, 2) as! u16; }
+    if format < 1 || format > 3 { return s, false; }
+    if format >= 2 { s.version = sess_get(r, b, 2) as! u16; }
     s.suite = sess_get(r, b, 2) as! u16;
     s.psk.append(sess_get_vec(r, b, 1, 48));
     var ems: u64 = 0;
-    if format == 2 { ems = sess_get(r, b, 1); }
+    if format >= 2 { ems = sess_get(r, b, 1); }
     s.ems = ems == 1;
     s.age_add = sess_get(r, b, 4) as! u32;
     s.lifetime = sess_get(r, b, 4) as! i64;
@@ -115,8 +121,16 @@ fn parse_session(b: const u8[:]) -> Session, bool {
     s.alpn.append(sess_get_vec(r, b, 1, 255));
     s.not_after = sess_get(r, b, 8) as! i64;
     s.max_early_data = sess_get(r, b, 4) as! u32;
+    // Older formats kept no chain: their sessions resume only for clients
+    // that do not verify.
+    var verified: u64 = 0;
+    if format >= 3 {
+        verified = sess_get(r, b, 1);
+        s.chain.append(sess_get_vec(r, b, 2, 12288));
+    }
+    s.verified = verified == 1;
     s.ticket.append(sess_get_vec(r, b, 2, 16384));
-    if r.bad || r.pos != b.len || ems > 1 || !state_ok(s.version, s.suite, s.psk) || s.lifetime > MAX_TICKET_LIFETIME {
+    if r.bad || r.pos != b.len || ems > 1 || verified > 1 || !state_ok(s.version, s.suite, s.psk) || s.lifetime > MAX_TICKET_LIFETIME {
         return no_session(), false;
     }
     return s, true;

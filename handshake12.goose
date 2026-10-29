@@ -260,7 +260,7 @@ fn client_server_hello12(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out
         if cfg.session.ems != ems { return fail(c, ALERT_HANDSHAKE_FAILURE, out); }
         c.resumed = true;
         set48(c.master, cfg.session.psk);
-        c.peer_not_after = cfg.session.not_after;
+        resume_peer(c, cfg);
         c.state = ST12_WAIT_CCS;
         return 0;
     }
@@ -304,6 +304,10 @@ fn client_server_key_exchange12(c: Conn&, cfg: const ClientConfig&, m: const u8[
     signed.append(c.peer_random);
     signed.append(m[4..params_end]);
     let leaf, okl = peer_leaf(c);
+    if okl && !usage_signs12(leaf) {
+        c.error = x509::ERR_KEY_USAGE;
+        return fail(c, ALERT_BAD_CERTIFICATE, out);
+    }
     // A scheme that does not fit the key is refused before any signature
     // check, as TLS 1.3's (RFC 8446 §4.4.3); Go gives decrypt_error.
     if okl && !scheme_fits12(leaf.key_type, scheme as! u16) { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
@@ -367,6 +371,11 @@ fn client_server_hello_done12(c: Conn&, cfg: const ClientConfig&, m: const u8[:]
         let leaf, okl = peer_leaf(c);
         let pub, okp = x509::rsa_public_key(leaf);
         if !okl || !okp { return fail(c, ALERT_UNSUPPORTED_CERTIFICATE, out); }
+        // Encrypting to the key needs keyEncipherment, if usage is given.
+        if leaf.has_key_usage && leaf.key_usage & x509::KU_KEY_ENCIPHERMENT == 0 {
+            c.error = x509::ERR_KEY_USAGE;
+            return fail(c, ALERT_BAD_CERTIFICATE, out);
+        }
         var r: u8[46] = [0; 46];
         drbg_fill(c, r);
         pms.push(3);
@@ -424,6 +433,7 @@ fn client_new_session_ticket12(c: Conn&, cfg: const ClientConfig&, m: const u8[:
     s.server_name.append(cfg.server_name);
     s.alpn.append(c.alpn);
     s.not_after = c.peer_not_after;
+    keep_chain(c, s);
     s.ticket.append(m[ticket.pos..ticket.end]);
     c.session = s;
     return 0;
@@ -745,6 +755,10 @@ fn server_certificate_verify12(c: Conn&, m: const u8[:], out: u8[>..]&) -> i64 {
     if !offered_scheme(SIG_SCHEMES12, scheme as! u16) { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
     if c.log_over { return fail(c, ALERT_INTERNAL_ERROR, out); }
     let leaf, okl = peer_leaf(c);
+    if okl && !usage_signs12(leaf) {
+        c.error = x509::ERR_KEY_USAGE;
+        return fail(c, ALERT_BAD_CERTIFICATE, out);
+    }
     if okl && !scheme_fits12(leaf.key_type, scheme as! u16) { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
     if !okl || !verify12(leaf, scheme as! u16, c.log, m[sig.pos..sig.end]) { return fail(c, ALERT_DECRYPT_ERROR, out); }
     hs_add(c, m);

@@ -8,7 +8,8 @@
 // A session must fall back to a full handshake under a suite of another
 // hash, another ticket key, or a server sending no tickets. It must not be
 // offered expired, for another name or with a changed ticket. A changed
-// binder must fail the handshake.
+// binder must fail the handshake. A client that verifies must offer only a
+// session that was verified and whose chain its roots still accept.
 import std;
 import tls from "..";
 import bignum from "../../bigmongoose.git";
@@ -41,7 +42,7 @@ fn field(kind: const u8[:], idx: i64) -> u8[>..] {
     for line in split(embed_file("vectors/hs_certs.txt"), '\n') {
         let w = words(line);
         if w.len < 3 { continue; }
-        if w[0] == "root" && kind == "root" { return unhex(w[idx - 1]); }
+        if w[0] == kind && (kind == "root" || kind == "clientca") { return unhex(w[idx - 1]); }
         if w[0] == "server" && w[1] == kind { return unhex(w[idx]); }
     }
     assert(false);
@@ -94,12 +95,65 @@ fn connect(label: const u8[:], cc: const tls::ClientConfig&, sc: const tls::Serv
     let sent2 = tls::send(s, "pong", to_client);
     let r = tls::client_feed(c, cc, to_client, to_server, capp);
     let data = sent && sent2 && sapp == "ping" && capp == "pong";
-    // Both sides agree on resumption; resumed, no certificate was sent.
-    let agree = tls::resumed(c) == tls::resumed(s) && (!tls::resumed(c) || c.chain.len == 0);
+    // Both sides agree on resumption; resumed, the server's chain is the
+    // session's, verified when the client verifies.
+    let agree = tls::resumed(c) == tls::resumed(s) &&
+                (!tls::resumed(c) || (c.chain[..] == cc.session.chain[..] && tls::peer_verified(c) == cc.verify));
     check(str(label, ": connected"), ok && data && agree);
     let sess, has = tls::session(c);
     check(str(label, ": a ticket"), has == (sc.tickets > 0) && c.tickets == sc.tickets);
     return ok, tls::resumed(c), sess;
+}
+
+// Whether a client offers its session.
+fn offered(cc: const tls::ClientConfig&) -> bool {
+    var c = tls::client(cc);
+    var out: u8[>..] = [];
+    tls::client_start(c, cc, out);
+    return c.psk_offered;
+}
+
+fn verification_policy(sc: const tls::ServerConfig&, sess: const tls::Session&) {
+    check("verified session", sess.verified && sess.chain.len > 0);
+    // A session got without verifying resumes only without verifying.
+    var nv = client_cfg();
+    nv.verify = false;
+    let ok0, r0, unverified = connect("not verifying", nv, sc);
+    check("unverified session", ok0 && !unverified.verified);
+    nv.session = unverified;
+    let ok1, r1, s1 = connect("unverified, resumed without verifying", nv, sc);
+    check("unverified: resumed without verifying", ok1 && r1 && !s1.verified);
+    var strict = client_cfg();
+    strict.session = unverified;
+    check("unverified: not offered when verifying", !offered(strict));
+    let empty = x509::new_pool();
+    var no_roots = tls::client_config_pool("example.com", empty);
+    no_roots.now = NOW;
+    no_roots.session = unverified;
+    check("unverified, no roots: not offered", !offered(no_roots));
+    // A verified one stops resuming once the roots no longer take its
+    // chain, or once its certificate is out of date.
+    no_roots.session = sess;
+    check("roots removed: not offered", !offered(no_roots));
+    var other_root = tls::client_config("example.com", field("clientca", 2));
+    other_root.now = NOW;
+    other_root.session = sess;
+    check("roots replaced: not offered", !offered(other_root));
+    var lax = client_cfg();
+    lax.verify = false;
+    lax.session = sess;
+    check("verified, not verifying: offered", offered(lax));
+    // Kept through bytes; the formats before 3 kept no chain, so their
+    // sessions count as unverified.
+    let b = tls::session_bytes(sess);
+    let back, okb = tls::parse_session(b);
+    check("bytes keep the chain", okb && back.verified && back.chain[..] == sess.chain[..]);
+    let tail = 2 + sess.ticket.len;
+    var old: u8[>..] = [2];
+    old.append(b[1..b.len - tail - 3 - sess.chain.len]);
+    old.append(b[b.len - tail..]);
+    let v2, ok2 = tls::parse_session(old);
+    check("format 2: unverified", ok2 && !v2.verified && v2.chain.len == 0 && v2.ticket[..] == sess.ticket[..]);
 }
 
 fn main() {
@@ -214,6 +268,8 @@ fn main() {
     var app13: u8[>..] = [];
     let rr = tls::server_feed(s13, sc, hello, reply, app13);
     check("changed binder", rr == -1 && s13.alert == tls::ALERT_DECRYPT_ERROR);
+
+    verification_policy(sc, sess);
 
     print("resumption: ", checks, " checks, ", failures, " failed");
     assert(failures == 0);

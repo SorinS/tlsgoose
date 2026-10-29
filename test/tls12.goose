@@ -8,7 +8,8 @@
 //   does not use;
 // - client certificates and ALPN;
 // - a changed record, renegotiation refused both ways, and servers whose
-//   keys TLS 1.2 cannot use (ML-DSA).
+//   keys TLS 1.2 cannot use (ML-DSA);
+// - keyUsage against what the key does, in TLS 1.3 and 1.2.
 import std;
 import tls from "..";
 import bignum from "../../bigmongoose.git";
@@ -17,6 +18,8 @@ import x509 from "../../x509goose.git";
 import tls.handshake;
 import tls.session;
 import tls.record;
+import x509.create;
+import x509.keys;
 
 var failures = 0;
 var checks = 0;
@@ -301,6 +304,33 @@ fn resumption() {
         let o8 = connect(cc_late, sc_late);
         check("expired, full", o8.ok && !o8.resumed);
     }
+    // A session got without verifying resumes only without verifying; one
+    // verified stops resuming when the roots no longer take its chain.
+    {
+        let sc = server_cfg("p256");
+        var nv = client12();
+        nv.verify = false;
+        let o1 = connect(nv, sc);
+        check("unverified session", o1.ok && !o1.session.verified);
+        nv.session = o1.session;
+        check("unverified: resumed without verifying", connect(nv, sc).resumed);
+        var strict = client12();
+        strict.session = o1.session;
+        var c = tls::client(strict);
+        var out: u8[>..] = [];
+        tls::client_start(c, strict, out);
+        check("unverified: not offered when verifying", !c.session12_offered);
+        let o2 = connect(strict, sc);
+        check("full handshake instead", o2.ok && !o2.resumed && o2.session.verified);
+        var other = tls::client_config("example.com", field("clientca", "", 2));
+        other.now = NOW;
+        other.max_version = tls::VERSION_TLS12;
+        other.session = o2.session;
+        var c2 = tls::client(other);
+        var out2: u8[>..] = [];
+        tls::client_start(c2, other, out2);
+        check("roots replaced: not offered", !c2.session12_offered);
+    }
 }
 
 fn client_certificates() {
@@ -318,6 +348,13 @@ fn client_certificates() {
             cc.session = o.session;
             let o2 = connect(cc, sc);
             check(str("client cert resumed ", kind), o2.ok && o2.resumed && o2.verified);
+            // Under other client CAs the ticket's certificate no longer
+            // verifies: a full handshake, which then refuses it.
+            var sc_other = copy(sc);
+            sc_other.client_cas = x509::new_pool();
+            check("other CA", x509::pool_add(sc_other.client_cas, field("root", "", 2)));
+            let o3 = connect(cc, sc_other);
+            check(str("client CAs changed: not resumed ", kind), !o3.ok && !o3.resumed);
         }
         // ML-DSA cannot sign in TLS 1.2: the client sends no certificate.
         var cc_pq = client12();
@@ -430,6 +467,71 @@ fn records() {
     }
 }
 
+// A leaf for example.com under root, on key, with that keyUsage.
+fn usage_leaf(root: const u8[:], root_key: const x509::PrivateKey&, key: const x509::PrivateKey&, usage: u32) -> u8[>..] {
+    var t, ok = x509::template("CN=example.com", NOW - 3600, NOW + 86400);
+    t.key_usage = usage;
+    t.ext_key_usage = x509::EKU_SERVER_AUTH;
+    x509::add_dns(t.san, "example.com");
+    let der, e = x509::create_certificate(t, x509::marshal_public_key(key), root, root_key);
+    check("leaf made", ok && e == x509::OK);
+    return der;
+}
+
+fn usage_server(chain: const u8[:], key: const x509::PrivateKey&, suite12: u16) -> tls::ServerConfig {
+    var sc, ok = tls::server_config(chain, x509::marshal_pkcs8(key));
+    check("server key", ok);
+    sc.now = NOW;
+    if suite12 != 0 {
+        sc.suites12.clear();
+        sc.suites12.push(suite12);
+    }
+    return sc;
+}
+
+// keyUsage, when a certificate has it, must allow what TLS does with the
+// key: signing in TLS 1.3 (digitalSignature, RFC 8446 §4.4.2.2), and in
+// TLS 1.2 for every key but RSA (as OpenSSL); encrypting to it in TLS
+// 1.2's RSA key exchange (keyEncipherment).
+fn key_usage() {
+    let root_key = x509::generate_key(x509::KEY_ED25519);
+    var rt, okr = x509::template("CN=Goose Usage Root", NOW - 3600, NOW + 86400);
+    rt.is_ca = true;
+    rt.key_usage = x509::KU_KEY_CERT_SIGN;
+    let root, er = x509::create_certificate(rt, x509::marshal_public_key(root_key), "", root_key);
+    check("root made", okr && er == x509::OK);
+    var cc13 = tls::client_config("example.com", root);
+    cc13.now = NOW;
+    var cc12 = copy(cc13);
+    cc12.max_version = tls::VERSION_TLS12;
+    let ek = x509::generate_key(x509::KEY_EC_P256);
+    let ec_enc = usage_server(usage_leaf(root, root_key, ek, x509::KU_KEY_ENCIPHERMENT), ek, 0);
+    let ec_sign = usage_server(usage_leaf(root, root_key, ek, x509::KU_DIGITAL_SIGNATURE), ek, 0);
+    let o1 = connect(cc13, ec_enc);
+    check("1.3, keyEncipherment only: refused", !o1.ok && o1.client_alert == tls::ALERT_BAD_CERTIFICATE);
+    check("1.3, digitalSignature", connect(cc13, ec_sign).ok);
+    let o2 = connect(cc12, ec_enc);
+    check("1.2 ECDHE_ECDSA, keyEncipherment only: refused", !o2.ok && o2.client_alert == tls::ALERT_BAD_CERTIFICATE);
+    check("1.2 ECDHE_ECDSA, digitalSignature", connect(cc12, ec_sign).ok);
+    let rk, okk = x509::parse_private_key(field("server", "rsa", 3));
+    check("rsa key", okk);
+    let rsa_enc = usage_leaf(root, root_key, rk, x509::KU_KEY_ENCIPHERMENT);
+    let rsa_sign = usage_leaf(root, root_key, rk, x509::KU_DIGITAL_SIGNATURE);
+    let s_enc = usage_server(rsa_enc, rk, 0);
+    let o3 = connect(cc13, s_enc);
+    check("1.3 RSA, keyEncipherment only: refused", !o3.ok && o3.client_alert == tls::ALERT_BAD_CERTIFICATE);
+    let s_ecdhe = usage_server(rsa_enc, rk, tls::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256);
+    check("1.2 ECDHE_RSA, keyEncipherment only: taken", connect(cc12, s_ecdhe).ok);
+    var cck = copy(cc12);
+    cck.suites12.clear();
+    cck.suites12.push(tls::TLS_RSA_WITH_AES_128_GCM_SHA256);
+    let s_kx = usage_server(rsa_enc, rk, tls::TLS_RSA_WITH_AES_128_GCM_SHA256);
+    check("1.2 RSA key exchange, keyEncipherment", connect(cck, s_kx).ok);
+    let s_kx_sign = usage_server(rsa_sign, rk, tls::TLS_RSA_WITH_AES_128_GCM_SHA256);
+    let o4 = connect(cck, s_kx_sign);
+    check("1.2 RSA key exchange, digitalSignature only: refused", !o4.ok && o4.client_alert == tls::ALERT_BAD_CERTIFICATE);
+}
+
 fn main() {
     suites_and_groups();
     versions();
@@ -437,6 +539,7 @@ fn main() {
     client_certificates();
     alpn_and_failures();
     records();
+    key_usage();
     print("tls12: ", checks, " checks, ", failures, " failed");
     if failures > 0 { exit(1); }
 }

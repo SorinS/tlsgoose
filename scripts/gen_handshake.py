@@ -40,6 +40,9 @@ def main():
         with open(p("ext"), "w") as f:
             f.write("basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n"
                     "extendedKeyUsage=serverAuth,clientAuth\nsubjectAltName=DNS:example.com,DNS:localhost\n")
+        with open(p("ext_rsa"), "w") as f:
+            f.write("basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\n"
+                    "extendedKeyUsage=serverAuth,clientAuth\nsubjectAltName=DNS:example.com,DNS:localhost\n")
         for kind, args in [("ed25519", ["-algorithm", "ED25519"]),
                            ("p256", ["-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256"]),
                            ("p384", ["-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-384"]),
@@ -50,8 +53,10 @@ def main():
                            ("mldsa87", ["-algorithm", "ML-DSA-87"])]:
             ossl("genpkey", *args, "-out", p(f"{kind}.key"))
             ossl("req", "-new", "-key", p(f"{kind}.key"), "-subj", "/CN=example.com", "-out", p(f"{kind}.csr"))
+            # An RSA key also encrypts, in TLS 1.2's RSA key exchange, so it
+            # gets keyEncipherment as well (as Go's generate_cert gives it).
             ossl("x509", "-req", "-in", p(f"{kind}.csr"), "-CA", p("root.pem"), "-CAkey", p("root.key"),
-                 "-days", "7000", "-extfile", p("ext"), "-out", p(f"{kind}.pem"))
+                 "-days", "7000", "-extfile", p("ext_rsa" if kind == "rsa" else "ext"), "-out", p(f"{kind}.pem"))
             native = "-"
             if kind.startswith("p"):
                 native = ossl("ec", "-in", p(f"{kind}.key"), "-outform", "DER").hex()

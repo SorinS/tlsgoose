@@ -83,7 +83,7 @@ EC, Ed25519, ML-DSA), SEC 1 or PKCS #1 DER.
 |---|---|---|
 | Suites | all three, in `cfg.suites` order | its own order of preference |
 | Key exchange | The post-quantum X25519MLKEM768 (the default), SecP256r1MLKEM768 and SecP384r1MLKEM1024 hybrids and MLKEM1024 alone; X25519, P-256, P-384, P-521. The defaults are Go's: everything but MLKEM1024. The client sends a share for the first of `cfg.groups` (plus, beside a hybrid, a share of its ECDH part on the same key, as Go does) and reaches the others through HelloRetryRequest | its first group the client has a share for, else a HelloRetryRequest for its first group the client supports |
-| Certificates | checked by `x509::verify_with_roots`: chain to `cfg.roots`, or to the system's roots when `cfg.system_roots`, name `cfg.server_name`, time `cfg.now` (0 for now); `cfg.verify = false` skips it | sends `cfg.chain`, signs CertificateVerify with RSA-PSS, ECDSA (P-256, P-384, P-521), Ed25519 or ML-DSA as its key and the client allow |
+| Certificates | checked by `x509::verify_with_roots`: chain to `cfg.roots`, or to the system's roots when `cfg.system_roots`, name `cfg.server_name`, time `cfg.now` (0 for now); `cfg.verify = false` skips it. Whatever `verify`, a leaf with keyUsage must allow what TLS does with it (digitalSignature to sign in TLS 1.3, and in TLS 1.2 but for RSA keys, as OpenSSL; keyEncipherment for RSA key exchange) | sends `cfg.chain`, signs CertificateVerify with RSA-PSS, ECDSA (P-256, P-384, P-521), Ed25519 or ML-DSA as its key and the client allow |
 | CertificateVerify | ML-DSA-44/65/87 (draft-ietf-tls-mldsa, offered first, as Go does), RSA-PSS, RSA PKCS #1 v1.5, ECDSA P-256/P-384/P-521, Ed25519 | |
 | Client certificates | sends `cfg.cert_chain` (set with `tls::set_client_certificate(cfg, chain_der, key_der)`) when asked, if its key signs with a scheme the server takes and, if the server names CAs, one of its certificates was issued by one of them; otherwise an empty Certificate | asks per `cfg.client_auth`, Go's modes: `NO_CLIENT_CERT` (the default), `REQUEST_CLIENT_CERT`, `REQUIRE_ANY_CLIENT_CERT`, `VERIFY_CLIENT_CERT_IF_GIVEN`, `REQUIRE_AND_VERIFY_CLIENT_CERT`; names the CAs of `cfg.client_cas` and checks chains against them (the system's roots when empty, as Go) for client authentication; `tls::peer_certificates(c)`, `tls::peer_verified(c)` |
 | ALPN | `cfg.alpn` offered | its first protocol the client offered, or `no_application_protocol` |
@@ -149,14 +149,24 @@ A `Session` holds what the client needs:
   lifetime (at most 7 days);
 - the server name and ALPN protocol;
 - the certificate's notAfter, after which the session is not offered, as
-  in Go.
+  in Go;
+- whether the server's chain was verified, and the chain itself (up to
+  12 KB).
 
-A resumed connection skips the server's Certificate and
-CertificateVerify, so `c.chain` is empty.
+A client that verifies offers a session only if its chain was verified
+and still verifies, under its roots, time and server name now, as Go's
+`loadSession` checks; so a session got with `verify` off, or one whose
+root has since been removed, gives a full handshake. Sessions saved in
+earlier formats (before format 3) have no chain and resume only without
+verifying. A resumed connection skips the server's Certificate and
+CertificateVerify; `c.chain` is the session's, and `peer_verified(c)` is
+true when the client verifies.
 
 The server keeps nothing: each ticket seals the session's state (suite,
 PSK, creation time, age_add, ALPN, server name, the client's certificate)
-with ChaCha20-Poly1305
+with ChaCha20-Poly1305. A ticket's client certificate resumes only if it
+still suits the server's client_auth and, when the server checks client
+certificates, still verifies under its client CAs now (as Go).
 under `cfg.ticket_key`. That key is random per `server_config`, so share
 it to let several servers resume each other's sessions. A ticket it cannot
 open, from another suite's hash, or older than its lifetime gives a full
@@ -241,9 +251,11 @@ that could do better.
 The records are TLS 1.2's: AES-GCM with an explicit nonce (the sequence
 number, as Go and OpenSSL send it), ChaCha20-Poly1305 (RFC 7905), and
 AES-CBC with HMAC-SHA1 or HMAC-SHA256, MAC-then-encrypt, with a random IV
-per record. CBC padding is checked in constant time, and the MAC is
-computed over the same length whatever the padding says, with the
-padding hashed after it, as Go does against Lucky13. TLS 1.2's warning
+per record. Against Lucky13, CBC padding is checked in constant time, the
+MAC is computed in time that does not depend on the length the padding
+gives (bignum's `hmac_prefix_ct`, as OpenSSL's `ssl3_cbc_digest_record`;
+Go only approximates this), and the received MAC is read in constant
+time. `scripts/cbc_timing.py` measures it. TLS 1.2's warning
 alerts are dropped, as Go drops them, and KeyUpdate is TLS 1.3's alone. ECH
 is TLS 1.3's too: a client that offers it offers nothing older.
 
@@ -328,6 +340,7 @@ python3 scripts/rfc8448.py              # re-extract RFC 8448's trace (fetches t
 tools/gointerop.sh <mode> -flags ...    # Go's side by hand (gointerop.sh <mode> -h lists the flags)
 python3 scripts/bench_openssl.py [prefix]   # handshakes and throughput against OpenSSL
 python3 scripts/tlsfuzzer.py run [config ...]   # tlsfuzzer's scripts against the server (../tlsfuzzer.git)
+python3 scripts/cbc_timing.py [scale]   # CBC records' timing against Lucky13 (native -O2; a quiet machine)
 ```
 
 `scripts/tlsfuzzer.py` needs tlsfuzzer.git beside this repository and an
@@ -373,7 +386,11 @@ library only).
   - with a full handshake instead under another hash, another ticket key,
     a server without tickets, a ticket too old or changed;
   - is not offered expired or for another name;
-  - a changed binder is refused.
+  - a changed binder is refused;
+  - a client that verifies does not offer a session got without
+    verifying, nor one whose chain its roots (removed or replaced) no
+    longer accept; sessions bytes keep the chain, and format 2's count as
+    unverified.
 
 - `client_auth`: client certificates under each of the five modes:
   - requested or not, required or not, checked or not;
@@ -415,7 +432,13 @@ library only).
     missing, refused, and carried over by resumption; ALPN;
   - a wrong name, an unknown root; renegotiation refused both ways while
     data keeps flowing; a changed record under GCM, ChaCha20-Poly1305 and
-    CBC.
+    CBC;
+  - sessions: one got without verifying is not offered when verifying,
+    nor one whose roots were replaced; a client certificate's ticket is
+    not resumed under other client CAs;
+  - keyUsage: digitalSignature required for TLS 1.3's CertificateVerify
+    and TLS 1.2's ECDSA and EdDSA signatures, keyEncipherment for RSA key
+    exchange; an RSA key may sign ECDHE_RSA without it, as in OpenSSL.
 
 `scripts/live_interop.py` runs live connections against OpenSSL (179
 cases). It builds `tools/peer.goose`, a peer driven over stdin and stdout,

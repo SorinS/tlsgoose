@@ -1062,7 +1062,7 @@ fn client_start(c: Conn&, cfg: const ClientConfig&, out: u8[>..]&) {
     // A session is offered when it is still good for this server and one of
     // the suites offered has its hash (TLS 1.3), or is its suite (TLS 1.2).
     c.psk_offered = false;
-    let usable = session_usable(cfg.session, cfg.server_name, now_ms(cfg.now));
+    let usable = session_resumable(cfg);
     if usable && cfg.session.version == VERSION_TLS12 && c.offer12 {
         for s12 in cfg.suites12 { if s12 == cfg.session.suite { c.session12_offered = true; } }
     }
@@ -1248,7 +1248,7 @@ fn client_server_hello(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: 
             return fail(c, ALERT_ILLEGAL_PARAMETER, out);
         }
         c.resumed = true;
-        c.peer_not_after = cfg.session.not_after;
+        resume_peer(c, cfg);
     }
     c.sch = schedule(s.hash, if c.resumed { cfg.session.psk[..] } else { "" });
     schedule_handshake(c.sch, shared, transcript_hash(c.th));
@@ -1337,24 +1337,60 @@ fn client_certificate(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u
     return 0;
 }
 
+// A server's chain (DER concatenated, leaf first) checked for `name`
+// under the client's roots now: x509::OK or the error.
+fn server_chain_error(cfg: const ClientConfig&, chain: const u8[:], name: const u8[:]) -> i64 {
+    let ct, okt = asn1::read(chain, 0, chain.len);
+    if !okt { return x509::ERR_MALFORMED; }
+    let now = if cfg.now != 0 { cfg.now } else { time_ns() / 1000000000 };
+    if cfg.system_roots {
+        let es, found = x509::verify_with_system_roots(chain[..ct.end], chain[ct.end..], now, name);
+        return es;
+    }
+    return x509::verify_with_roots(chain[..ct.end], chain[ct.end..], cfg.roots, now, name);
+}
+
+// Whether the client may offer its session: still good for this server
+// and, when the client verifies, verified when it was made and its chain
+// still verifying under today's roots, time and name (Go's loadSession).
+fn session_resumable(cfg: const ClientConfig&) -> bool {
+    if !session_usable(cfg.session, cfg.server_name, now_ms(cfg.now)) { return false; }
+    if !cfg.verify { return true; }
+    return cfg.session.verified && server_chain_error(cfg, cfg.session.chain, cfg.server_name) == x509::OK;
+}
+
+// A new session gets the connection's verification and, when it fits,
+// the server's chain; one too long to keep is saved unverified, to resume
+// only without verifying.
+fn keep_chain(c: const Conn&, s: Session&) {
+    s.chain.clear();
+    s.verified = false;
+    if c.chain.len <= s.chain.cap {
+        s.chain.append(c.chain);
+        s.verified = c.peer_verified;
+    }
+}
+
+// A resumed connection's peer, as its session had it: verified only when
+// the client verifies (session_resumable checked the chain again).
+fn resume_peer(c: Conn&, cfg: const ClientConfig&) {
+    c.peer_not_after = cfg.session.not_after;
+    c.peer_verified = cfg.verify && cfg.session.verified;
+    c.chain.clear();
+    c.chain.append(cfg.session.chain);
+}
+
 // The server's chain in c.chain, checked when the client checks them: 0,
 // or -1 after failing.
 fn check_server_chain(c: Conn&, cfg: const ClientConfig&, out: u8[>..]&) -> i64 {
     let ct, okt = asn1::read(c.chain, 0, c.chain.len);
     if !okt { return fail(c, ALERT_BAD_CERTIFICATE, out); }
     if cfg.verify {
-        let now = if cfg.now != 0 { cfg.now } else { time_ns() / 1000000000 };
         // ECH not accepted, the certificate must be for the public name
         // (§6.1.7).
         var name: u8[>..] = [];
         name.append(if c.ech_offered && !c.ech_accepted { c.ech_public_name[..] } else { cfg.server_name[..] });
-        var e = x509::OK;
-        if cfg.system_roots {
-            let es, found = x509::verify_with_system_roots(c.chain[..ct.end], c.chain[ct.end..], now, name);
-            e = es;
-        } else {
-            e = x509::verify_with_roots(c.chain[..ct.end], c.chain[ct.end..], cfg.roots, now, name);
-        }
+        let e = server_chain_error(cfg, c.chain, name);
         if e != x509::OK {
             c.error = e;
             return fail(c, cert_alert(e), out);
@@ -1365,6 +1401,17 @@ fn check_server_chain(c: Conn&, cfg: const ClientConfig&, out: u8[>..]&) -> i64 
     }
     return 0;
 }
+
+// Whether a certificate's keyUsage, when it has one, lets its key sign
+// (RFC 5280 §4.2.1.3): TLS 1.3 requires digitalSignature (§4.4.2.2).
+fn usage_signs(leaf: const x509::Cert&) -> bool {
+    !leaf.has_key_usage || leaf.key_usage & x509::KU_DIGITAL_SIGNATURE != 0
+}
+
+// TLS 1.2's rule, as OpenSSL's: RSA keys are not held to it, since RSA
+// certificates were long issued for keyEncipherment alone and signed
+// ECDHE_RSA anyway; every other key must allow signing.
+fn usage_signs12(leaf: const x509::Cert&) -> bool { leaf.key_type == x509::KEY_RSA || usage_signs(leaf) }
 
 // The peer's CertificateVerify, by the leaf of c.chain over the transcript
 // so far (§4.4.3); 0, or -1 after failing.
@@ -1377,6 +1424,10 @@ fn peer_certificate_verify(c: Conn&, m: const u8[:], out: u8[>..]&) -> i64 {
     let ct, okt = asn1::read(c.chain, 0, c.chain.len);
     let leaf, e = x509::parse(c.chain[..ct.end]);
     if e != x509::OK { return fail(c, ALERT_BAD_CERTIFICATE, out); }
+    if !usage_signs(leaf) {
+        c.error = x509::ERR_KEY_USAGE;
+        return fail(c, ALERT_BAD_CERTIFICATE, out);
+    }
     if !scheme_fits13(leaf.key_type, scheme as! u16) { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
     let content = cv_content(!c.is_server, transcript_hash(c.th));
     if x509::verify_scheme(leaf, scheme as! u16, content, m[sig.pos..sig.end]) != x509::OK {
@@ -1581,6 +1632,7 @@ fn client_ticket(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8[>..
     s.server_name.append(cfg.server_name);
     s.alpn.append(c.alpn);
     s.not_after = c.peer_not_after;
+    keep_chain(c, s);
     s.max_early_data = max_early as! u32;
     s.ticket.append(m[ticket.pos..ticket.end]);
     c.session = s;
@@ -2167,13 +2219,15 @@ fn select_alpn(c: Conn&, cfg: const ServerConfig&, h: const Hello&, m: const u8[
 
 // Whether a ticket's client certificate suits what the server asks of
 // clients now, as Go checks: one if required, none if none is asked for,
-// unexpired, and checked if the server checks them.
+// unexpired, and, if the server checks them, checked then and still
+// verifying under today's client CAs.
 fn ticket_client_ok(cfg: const ServerConfig&, t: const TicketState&, now: i64) -> bool {
     if t.client_chain.len == 0 {
         return cfg.client_auth != REQUIRE_ANY_CLIENT_CERT && cfg.client_auth != REQUIRE_AND_VERIFY_CLIENT_CERT;
     }
     if cfg.client_auth == NO_CLIENT_CERT || now > t.client_not_after { return false; }
-    return cfg.client_auth < VERIFY_CLIENT_CERT_IF_GIVEN || t.client_verified;
+    if cfg.client_auth < VERIFY_CLIENT_CERT_IF_GIVEN { return true; }
+    return t.client_verified && client_chain_error(cfg, t.client_chain) == x509::OK;
 }
 
 // CertificateRequest (§4.3.2): an empty context, the schemes accepted and,
@@ -2229,6 +2283,19 @@ fn server_client_certificate(c: Conn&, cfg: const ServerConfig&, m: const u8[:],
     return 0;
 }
 
+// A client's chain (DER concatenated, leaf first) checked under the
+// server's client CAs now: x509::OK or the error.
+fn client_chain_error(cfg: const ServerConfig&, chain: const u8[:]) -> i64 {
+    let ct, okt = asn1::read(chain, 0, chain.len);
+    if !okt { return x509::ERR_MALFORMED; }
+    let now = now_ms(cfg.now) / 1000;
+    if x509::pool_len(cfg.client_cas) == 0 {
+        let es, found = x509::verify_client_with_system_roots(chain[..ct.end], chain[ct.end..], now);
+        return es;
+    }
+    return x509::verify_client_with_roots(chain[..ct.end], chain[ct.end..], cfg.client_cas, now);
+}
+
 // The client's chain in c.chain, checked when the server checks them: 0,
 // or -1 after failing.
 fn check_client_chain(c: Conn&, cfg: const ServerConfig&, out: u8[>..]&) -> i64 {
@@ -2240,14 +2307,7 @@ fn check_client_chain(c: Conn&, cfg: const ServerConfig&, out: u8[>..]&) -> i64 
         return fail(c, ALERT_BAD_CERTIFICATE, out);
     }
     if cfg.client_auth >= VERIFY_CLIENT_CERT_IF_GIVEN {
-        let now = now_ms(cfg.now) / 1000;
-        var e = x509::OK;
-        if x509::pool_len(cfg.client_cas) == 0 {
-            let es, found = x509::verify_client_with_system_roots(c.chain[..ct.end], c.chain[ct.end..], now);
-            e = es;
-        } else {
-            e = x509::verify_client_with_roots(c.chain[..ct.end], c.chain[ct.end..], cfg.client_cas, now);
-        }
+        let e = client_chain_error(cfg, c.chain);
         if e != x509::OK {
             c.error = e;
             return fail(c, cert_alert(e), out);
