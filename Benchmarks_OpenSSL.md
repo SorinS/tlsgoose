@@ -82,6 +82,12 @@ A handshake is roughly the sum of its public-key operations. The
   share is the rest less ML-KEM.
 - **Resumption (ratio 0.35):** no certificate is involved, only one X25519
   exchange each way and the ticket's AES-GCM, so the gap is smallest.
+  **Since 2026-10-29 (tlsgoose 0bbe13c) it is 348 hs/s (0.08):** a client
+  that verifies checks a session's chain again under its roots now before
+  it resumes, as Go's `loadSession` does, which adds the chain's P-256
+  verification to every resumption. Before, a session got without
+  verifying, or one whose root had since been removed, resumed anyway. A
+  cache of successful verifications would win the speed back.
 - **Bulk AES-GCM (0.02):** this is hardware. On this CPU, OpenSSL uses the
   AES and PMULL instructions. Goose has no intrinsics, so bignum runs a
   bitsliced, table-free, constant-time AES and a carry-less GHASH in
