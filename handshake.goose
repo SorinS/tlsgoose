@@ -142,6 +142,8 @@ let HRR_RANDOM: u8[32] = [
 let SIG_SCHEMES: u16[13] = [0x0904, 0x0905, 0x0906, 0x0403, 0x0503, 0x0603, 0x0807, 0x0804, 0x0805, 0x0806,
                             0x0401, 0x0501, 0x0601];
 
+// A handshake message's body, at most (Go's maxHandshake); its 4-byte header
+// comes on top.
 let MAX_HANDSHAKE: i64 = 65536;
 
 // Records in a row that carry nothing (empty, or TLS 1.2 warning
@@ -332,7 +334,7 @@ struct Conn {
     ch_inner: u8[..8192],             // the client's first ClientHelloInner, until the hash is known
     ch: u8[..8192],                   // the client's first ClientHello, until the hash is known
     inbuf: u8[..18437],               // one record in arrival
-    hs: u8[..65536],                  // handshake messages being reassembled
+    hs: u8[..65540],                  // handshake messages being reassembled: MAX_HANDSHAKE and a header
     chain: u8[..65536],               // the peer's certificates, DER concatenated, leaf first
 }
 
@@ -2510,7 +2512,7 @@ fn handle_record(c: Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&,
         if n == 0 { break; }
         var msg: u8[>..] = [];
         msg.append(c.hs[..n]);
-        var rest: u8[..65536] = [];
+        var rest: u8[..65540] = [];
         rest.append(c.hs[n..]);
         c.hs = rest;
         let r = if c.is_server { server_message(c, scfg, msg, out) } else { client_message(c, ccfg, msg, out) };
@@ -2520,7 +2522,7 @@ fn handle_record(c: Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&,
     }
     if c.hs.len >= 4 {
         let want = (c.hs[1] as i64) << 16 | (c.hs[2] as i64) << 8 | c.hs[3];
-        if want + 4 > MAX_HANDSHAKE { return fail(c, ALERT_DECODE_ERROR, out); }
+        if want > MAX_HANDSHAKE { return fail(c, ALERT_DECODE_ERROR, out); }
     }
     return 0;
 }

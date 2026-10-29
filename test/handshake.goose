@@ -294,6 +294,17 @@ fn oversized_handshake() {
     var app: u8[>..] = [];
     let r = tls::server_feed(s, sc, rec, out, app);
     check("oversized handshake message: decode_error", r == -1 && s.alert == tls::ALERT_DECODE_ERROR);
+    // The limit is the body's, 65536 bytes, as Go's maxHandshake: a header
+    // announcing 65536 waits for the rest, one announcing 65537 is refused.
+    var at: u8[>..] = [22, 3, 1, 0, 8, 1, 0x01, 0x00, 0x00, 3, 3, 0, 0];
+    var s_at = tls::server(sc);
+    var out_at: u8[>..] = [];
+    check("a 65536-byte handshake body: taken so far", tls::server_feed(s_at, sc, at, out_at, app) == 0 && out_at.len == 0);
+    var past: u8[>..] = [22, 3, 1, 0, 8, 1, 0x01, 0x00, 0x01, 3, 3, 0, 0];
+    var s_past = tls::server(sc);
+    var out_past: u8[>..] = [];
+    check("a 65537-byte handshake body: decode_error",
+          tls::server_feed(s_past, sc, past, out_past, app) == -1 && s_past.alert == tls::ALERT_DECODE_ERROR);
     // An empty cipher_suites, which must hold at least one suite: as
     // tlsfuzzer makes it from a hello with an empty session ID and one
     // extension, by setting the session ID's length to 5.
