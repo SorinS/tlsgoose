@@ -2494,7 +2494,12 @@ fn handle_record(c: Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&,
         return 0;
     }
     if ctype != CT_HANDSHAKE || payload.len == 0 { return fail(c, ALERT_UNEXPECTED_MESSAGE, out); }
-    if c.hs.len + payload.len > c.hs.cap { return fail(c, ALERT_UNEXPECTED_MESSAGE, out); }
+    // A handshake message longer than MAX_HANDSHAKE: its length is wrong
+    // for this implementation, so decode_error (RFC 8446 §6.2: "the length
+    // of the message was incorrect"), as tlsfuzzer expects; Go sends
+    // internal_error. unexpected_message would say the message was out of
+    // place, which it is not.
+    if c.hs.len + payload.len > c.hs.cap { return fail(c, ALERT_DECODE_ERROR, out); }
     c.hs.append(payload);
     loop {
         let n = handshake_length(c.hs);
@@ -2511,7 +2516,7 @@ fn handle_record(c: Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&,
     }
     if c.hs.len >= 4 {
         let want = (c.hs[1] as i64) << 16 | (c.hs[2] as i64) << 8 | c.hs[3];
-        if want + 4 > MAX_HANDSHAKE { return fail(c, ALERT_UNEXPECTED_MESSAGE, out); }
+        if want + 4 > MAX_HANDSHAKE { return fail(c, ALERT_DECODE_ERROR, out); }
     }
     return 0;
 }

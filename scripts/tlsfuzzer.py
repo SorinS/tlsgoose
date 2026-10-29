@@ -140,6 +140,26 @@ def serve(args):
                                         "received": received.hex()}) + "\n")
             print(f"crash: exit {code}: {err.strip()[-300:]}", file=sys.stderr, flush=True)
 
+    def lingering_close(sock):
+        """Closes as a careful server does (nginx's lingering close): FIN
+        first, then the client's remaining bytes read and dropped until it
+        closes, or 300 s pass (tlsfuzzer's own limit for its largest
+        messages), or 10 s with nothing. Closing with unread data sends a
+        reset instead, which can reach the client before it has read the
+        alert, or fail its sends mid-message."""
+        try:
+            sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            return
+        start = time.monotonic()
+        sock.settimeout(10)
+        try:
+            while time.monotonic() - start < 300:
+                if not sock.recv(65536):
+                    break
+        except OSError:
+            pass
+
     class Handler(socketserver.BaseRequestHandler):
         def handle(self):
             sock = self.request
@@ -182,10 +202,7 @@ def serve(args):
             except OSError:
                 pass
             finally:
-                try:
-                    sock.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
+                lingering_close(sock)
             code, err = peer.stop()
             if code not in (0, None):
                 log_crash(code, err, received)

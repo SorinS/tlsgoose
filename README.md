@@ -7,6 +7,12 @@ and server connections, the key schedules and the record layer. It builds on
 for keys. Nothing here does I/O: a connection is fed the bytes that
 arrive, and hands back the bytes to send and the application data
 received. The caller owns the socket, or the pipe, or the test harness.
+Once a connection has failed or closed, send what it handed back (its
+alert), then close the way careful servers do: shut down writing, read
+and drop what the peer still sends until it closes or a timeout passes,
+and only then close. Closing with the peer's data unread sends a TCP
+reset, which can reach the peer before it has read the alert
+(`scripts/tlsfuzzer.py`'s server does this).
 
 - **`tls`**: cipher suites (`TLS_AES_128_GCM_SHA256`,
   `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`, and TLS 1.2's

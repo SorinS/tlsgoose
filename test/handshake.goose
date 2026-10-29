@@ -282,6 +282,20 @@ fn hrr_and_alpn() {
 }
 
 // Failures the client must catch, and roots.
+// A handshake message longer than MAX_HANDSHAKE (64 KB) is refused with
+// decode_error, its length being wrong (RFC 8446 §6.2), as soon as its
+// header says so.
+fn oversized_handshake() {
+    let sc = server_cfg("p256");
+    var s = tls::server(sc);
+    // A ClientHello whose header announces 70000 bytes, in one record.
+    var rec: u8[>..] = [22, 3, 1, 0, 8, 1, 0x01, 0x11, 0x70, 3, 3, 0, 0];
+    var out: u8[>..] = [];
+    var app: u8[>..] = [];
+    let r = tls::server_feed(s, sc, rec, out, app);
+    check("oversized handshake message: decode_error", r == -1 && s.alert == tls::ALERT_DECODE_ERROR);
+}
+
 fn client_failures() {
     // Failures the client must catch.
     var wrong_root = client_cfg();
@@ -388,6 +402,7 @@ fn main() {
     hybrid_defaults();
     hrr_and_alpn();
     client_failures();
+    oversized_handshake();
     records();
     print("handshake: ", checks, " checks, ", failures, " failed");
     assert(failures == 0);
