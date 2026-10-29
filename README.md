@@ -327,7 +327,14 @@ python3 scripts/openssl_interop.py      # recapture vectors of OpenSSL's connect
 python3 scripts/rfc8448.py              # re-extract RFC 8448's trace (fetches the RFC)
 tools/gointerop.sh <mode> -flags ...    # Go's side by hand (gointerop.sh <mode> -h lists the flags)
 python3 scripts/bench_openssl.py [prefix]   # handshakes and throughput against OpenSSL
+python3 scripts/tlsfuzzer.py run [config ...]   # tlsfuzzer's scripts against the server (../tlsfuzzer.git)
 ```
+
+`scripts/tlsfuzzer.py` needs tlsfuzzer.git beside this repository and an
+interpreter with its requirements (`--python`, by default
+`../.venv-tlsfuzzer/bin/python`; its docstring has the commands to make
+it). It writes each script's log, the server's crashes and a results
+table to `--out`.
 
 [Benchmarks_OpenSSL.md](Benchmarks_OpenSSL.md) has the figures, how they
 are measured, and the primitives' speeds from bigmongoose.git.
