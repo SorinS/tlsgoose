@@ -64,6 +64,33 @@ fn transcript_hash(t: const Transcript&) -> u8[>..] {
     return out;
 }
 
+// TLS 1.2's CertificateVerify signs the handshake messages with the hash
+// of its scheme, which is known only once CertificateRequest has come: so
+// all three of its hashes run from the first message.
+struct Log12 { s256: bignum::Sha256, s384: bignum::Sha512, s512: bignum::Sha512 }
+
+fn log12() -> Log12 { Log12 { s256: bignum::sha256_init(), s384: bignum::sha384_init(), s512: bignum::sha512_init() } }
+
+fn log12_add(l: Log12&, msg: const u8[:]) {
+    bignum::sha256_update(l.s256, msg);
+    bignum::sha512_update(l.s384, msg);
+    bignum::sha512_update(l.s512, msg);
+}
+
+// The digest of the messages so far by SHA-256, -384 or -512.
+fn log12_digest(l: const Log12&, hash: i64) -> u8[>..] {
+    var out: u8[>..] = [];
+    if hash == 256 {
+        var c = l.s256;
+        out.append(bignum::sha256_final(c));
+    } else {
+        assert(hash == 384 || hash == 512);
+        var c = if hash == 384 { l.s384 } else { l.s512 };
+        out = bignum::sha512_final(c);
+    }
+    return out;
+}
+
 // After a HelloRetryRequest the transcript restarts from message_hash(CH1)
 // (§4.4.1).
 fn transcript_restart_hrr(t: Transcript&) {

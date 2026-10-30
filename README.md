@@ -251,8 +251,24 @@ that could do better.
 | Signatures | RSA-PSS, RSA PKCS #1 v1.5, ECDSA (any of its hashes on any curve, as TLS 1.2 allows), Ed25519; no SHA-1, as Go since 1.25 | the client's first scheme its key signs with |
 | Master secret | extended (RFC 7627) when both take it; a session keeps what it had | the same |
 | Resumption | session tickets (RFC 5077): `tls::session(c)` is a TLS 1.2 session after a TLS 1.2 handshake, offered again in session_ticket | stateless tickets under `cfg.ticket_key`, a new one on each resumption |
-| Client certificates | sent when the server asks for its key's type and scheme and, if it names CAs, one of them issued it | Go's five modes, as in TLS 1.3 |
+| Client certificates | sent when the server asks for its key's type and scheme and, if it names CAs, one of them issued it; not Ed25519 ones (below) | Go's five modes, as in TLS 1.3; CertificateRequest offers every scheme above but Ed25519 |
 | Renegotiation | refused: secure renegotiation's extension is sent, and a HelloRequest gets a `no_renegotiation` warning | a ClientHello after the handshake gets the same warning |
+
+TLS 1.2's CertificateVerify signs all the handshake messages before it,
+with the hash of a scheme that is settled only when CertificateRequest
+comes. A connection does not keep the messages: SHA-256, SHA-384 and
+SHA-512 run over them from the ClientHello on, and CertificateVerify signs
+or checks the digest of its scheme's hash. Ed25519 signs a message itself,
+not its hash, and verifying needs the whole message after the signature
+has come, so it would need the messages kept (up to two Certificate
+messages and the rest, more than 128 KiB, in every connection, since a
+Goose struct holds its buffers in full). So a TLS 1.2 client certificate
+cannot be Ed25519 here, which Go allows: the server does not offer the
+scheme and refuses it with illegal_parameter, and a client with an Ed25519
+key sends no certificate, as Go's does for a key no offered scheme suits.
+TLS 1.3 signs a transcript hash and takes Ed25519 client certificates;
+Ed25519 server certificates work in TLS 1.2, as ServerKeyExchange signs
+only the randoms and the key exchange parameters.
 
 The records are TLS 1.2's: AES-GCM with an explicit nonce (the sequence
 number, as Go and OpenSSL send it), ChaCha20-Poly1305 (RFC 7905), and
@@ -437,8 +453,14 @@ library only).
   - resumption with tickets: resumed twice, from session bytes, a full
     handshake under another ticket key, without tickets, for a suite the
     client dropped, under TLS 1.3, or expired;
-  - client certificates (P-256, Ed25519; ML-DSA not usable), required,
-    missing, refused, and carried over by resumption; ALPN;
+  - client certificates (P-256; Ed25519 and ML-DSA not usable, Ed25519
+    taken in TLS 1.3), required, missing, refused, and carried over by
+    resumption; Certificate messages as long as they may be both ways
+    (more than the 128 KiB of messages once kept); ALPN;
+  - CertificateVerify by every scheme with RSA, P-256, P-384 and P-521
+    keys, from the running hashes: the same signature as over the
+    messages themselves (PKCS #1 v1.5 and ECDSA are deterministic), and
+    none for other messages; Ed25519 refused;
   - a wrong name, an unknown root; renegotiation refused both ways while
     data keeps flowing; a changed record under GCM, ChaCha20-Poly1305 and
     CBC;

@@ -65,7 +65,8 @@ def go_flags(tls12):
     return flags
 
 
-def goose_client_go_server(exe, gobin, client_cert=False, cert="p256", tls12=None, goose_args=(), want_tail=""):
+def goose_client_go_server(exe, gobin, client_cert=False, cert="p256", tls12=None, goose_args=(), want_tail="",
+                           client_kind="ed25519"):
     port = free_port()
     extra = ["-client-cas", os.path.join(VEC, "hs_clientca.pem")] if client_cert else []
     srv = subprocess.Popen([gobin, "server", "-cert", os.path.join(VEC, f"hs_{cert}.pem"),
@@ -79,8 +80,8 @@ def goose_client_go_server(exe, gobin, client_cert=False, cert="p256", tls12=Non
             if session:
                 args += ["--session", session]
             if client_cert:
-                args += ["--cert", os.path.join(VEC, "hs_client_ed25519.pem"),
-                         "--key", os.path.join(VEC, "hs_client_ed25519.key")]
+                args += ["--cert", os.path.join(VEC, f"hs_client_{client_kind}.pem"),
+                         "--key", os.path.join(VEC, f"hs_client_{client_kind}.key")]
             args += list(goose_args)
             peer = Peer(exe, args)
             sock = socket.create_connection(("127.0.0.1", port), timeout=10)
@@ -101,7 +102,7 @@ def goose_client_go_server(exe, gobin, client_cert=False, cert="p256", tls12=Non
             peer.close()
     finally:
         srv.kill()
-    client = "goose client ed25519" if client_cert else "-"
+    client = f"goose client {client_kind}" if client_cert else "-"
     want = [(False, f"echo hello 0 resumed=false client={client}{want_tail}"),
             (True, f"echo hello 1 resumed=true client={client}{want_tail}")]
     return results == want, results
@@ -296,7 +297,7 @@ def main():
     cases += [
         ("TLS 1.2 goose client's certificate to a Go server, resumed",
          lambda e, g: goose_client_go_server(e, g, client_cert=True, tls12=("only", ""), goose_args=("--max-version", "0303"),
-                                             want_tail=t12), None),
+                                             want_tail=t12, client_kind="p256"), None),
         ("TLS 1.2 Go client's certificate to this server, resumed",
          lambda e, g: go_client_goose_server(e, g, client_cert=True, cert="p256", tls12=("only", ""),
                                              goose_args=("--max-version", "0303"), want_tail=t12), None),

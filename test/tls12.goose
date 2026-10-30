@@ -338,7 +338,7 @@ fn client_certificates() {
         var sc = server_cfg("p256");
         sc.client_auth = tls::REQUIRE_AND_VERIFY_CLIENT_CERT;
         check("client CA", x509::pool_add(sc.client_cas, field("clientca", "", 2)));
-        let client_kinds: const u8[:][2] = ["p256", "ed25519"];
+        let client_kinds: const u8[:][1] = ["p256"];
         for kind in client_kinds {
             var cc = client12();
             check("client key", tls::set_client_certificate(cc, field("client", kind, 2), field("client", kind, 3)));
@@ -356,7 +356,17 @@ fn client_certificates() {
             let o3 = connect(cc, sc_other);
             check(str("client CAs changed: not resumed ", kind), !o3.ok && !o3.resumed);
         }
-        // ML-DSA cannot sign in TLS 1.2: the client sends no certificate.
+        // Ed25519 is no scheme of TLS 1.2's CertificateVerify here (only
+        // hashes of the messages are kept), nor ML-DSA, which TLS 1.2 has
+        // none of: the client sends no certificate.
+        var cc_ed = client12();
+        check("client key", tls::set_client_certificate(cc_ed, field("client", "ed25519", 2), field("client", "ed25519", 3)));
+        let o_ed = connect(cc_ed, sc);
+        check("ed25519 client cert: none sent", !o_ed.ok && o_ed.server_alert == tls::ALERT_BAD_CERTIFICATE);
+        var cc_ed13 = copy(cc_ed);
+        cc_ed13.max_version = tls::VERSION_TLS13;
+        let o_ed13 = connect(cc_ed13, sc);
+        check("ed25519 client cert in TLS 1.3", o_ed13.ok && o_ed13.version == tls::VERSION_TLS13 && o_ed13.verified);
         var cc_pq = client12();
         check("client key", tls::set_client_certificate(cc_pq, field("client", "mldsa44", 2), field("client", "mldsa44", 3)));
         let o_pq = connect(cc_pq, sc);
@@ -381,7 +391,114 @@ fn client_certificates() {
         check("client key", tls::set_client_certificate(cc, field("client", "p256", 2), field("client", "p256", 3)));
         let o_rsa = connect(cc, sc_rsa);
         check("client cert, rsa server", o_rsa.ok && o_rsa.verified);
+        var sc_ed_req = copy(sc);
+        sc_ed_req.client_auth = tls::REQUEST_CLIENT_CERT;
+        let o_ed_req = connect(cc_ed, sc_ed_req);
+        check("ed25519 client cert, requested: none sent", o_ed_req.ok && !o_ed_req.verified);
     }
+    {
+        // Certificate messages as long as they may be both ways: more
+        // handshake than the 128 KiB the messages were once kept in.
+        var sc = server_cfg("p256");
+        sc.client_auth = tls::REQUIRE_AND_VERIFY_CLIENT_CERT;
+        check("client CA", x509::pool_add(sc.client_cas, field("clientca", "", 2)));
+        let schain = fill_chain(field("server", "p256", 2));
+        sc.chain.clear();
+        sc.chain.append(schain);
+        var cc = client12();
+        let cchain = fill_chain(field("client", "p256", 2));
+        check("client key", tls::set_client_certificate(cc, cchain, field("client", "p256", 3)));
+        check("chains near the limit", cert_body_len(schain) > tls::MAX_HANDSHAKE - 300 && cert_body_len(schain) <= tls::MAX_HANDSHAKE &&
+              cert_body_len(cchain) > tls::MAX_HANDSHAKE - 300 && cert_body_len(cchain) <= tls::MAX_HANDSHAKE);
+        let o = connect(cc, sc);
+        check("longest certificate messages, client cert", o.ok && o.verified);
+    }
+}
+
+// TLS 1.2 Certificate's body for a chain of DER certificates: a u24 list
+// of u24-long certificates.
+fn cert_body_len(chain: const u8[:]) -> i64 {
+    var n = 3;
+    var pos = 0;
+    while pos < chain.len {
+        let t, ok = asn1::read(chain, pos, chain.len);
+        assert(ok);
+        n += 3 + t.end - pos;
+        pos = t.end;
+    }
+    return n;
+}
+
+// `leaf`, then unrelated certificates (which the peer ignores) to fill a
+// Certificate message as near MAX_HANDSHAKE as their sizes allow.
+fn fill_chain(leaf: const u8[:]) -> u8[>..] {
+    let kinds: const u8[:][8] = ["mldsa87", "mldsa65", "mldsa44", "rsa", "p521", "p384", "p256", "ed25519"];
+    var certs: u8[>..] = [];
+    var sizes: i64[>..] = [];
+    for k in kinds { let d = field("server", k, 2); sizes.push(d.len); certs.append(d); }
+    let budget = tls::MAX_HANDSHAKE - cert_body_len(leaf);
+    // Unbounded subset sum: from[b] is the certificate that last reached
+    // b bytes (each costing its length and 3), or -1.
+    var from: i64[>..] = [];
+    from.resize(budget + 1, -1);
+    from[0] = 8;
+    for b in budget + 1 {
+        if from[b] < 0 { continue; }
+        for i in 8 {
+            let nb = b + sizes[i] + 3;
+            if nb <= budget && from[nb] < 0 { from[nb] = i; }
+        }
+    }
+    var best = budget;
+    while from[best] < 0 { best--; }
+    var out: u8[>..] = [];
+    out.append(leaf);
+    while best > 0 {
+        let i = from[best];
+        var off = 0;
+        for j in i { off += sizes[j]; }
+        out.append(certs[off..off + sizes[i]]);
+        best -= sizes[i] + 3;
+    }
+    return out;
+}
+
+// CertificateVerify in TLS 1.2 by every scheme it takes, from the running
+// hashes: the same signature as over the messages themselves.
+fn certificate_verify_schemes() {
+    var raw: u8[>..] = [];
+    var log = tls::log12();
+    let msgs: const u8[:][3] = ["\x01\x00\x00\x02hi", "\x02\x00\x00\x00", "a longer message, as it were"];
+    for m in msgs { raw.append(m); tls::log12_add(log, m); }
+    var more = log;
+    tls::log12_add(more, "\x0e\x00\x00\x00");
+    let kinds: const u8[:][4] = ["rsa", "p256", "p384", "p521"];
+    var signed = 0;
+    for kind in kinds {
+        let k, okk = x509::parse_private_key(field("server", kind, 3));
+        let leaf, e = x509::parse(field("server", kind, 2));
+        check("cv key", okk && e == x509::OK);
+        for s in tls::CV_SCHEMES12 {
+            if !tls::scheme_fits12(k.kind, s) { continue; }
+            let label = str("cv ", kind, " ", suite_name(s));
+            let sig, ok = tls::cv_sign12(k, s, log);
+            check(label, ok && tls::verify12(leaf, s, raw, sig));
+            check(str(label, " verifies"), tls::cv_verify12(leaf, s, log, sig));
+            check(str(label, " other messages"), !tls::cv_verify12(leaf, s, more, sig));
+            let is_pss = s == x509::RSA_PSS_RSAE_SHA256 || s == x509::RSA_PSS_RSAE_SHA384 || s == x509::RSA_PSS_RSAE_SHA512;
+            if !is_pss {
+                let again, oka = tls::sign(k, s, raw);
+                check(str(label, " as over the messages"), oka && again == sig);
+            }
+            signed++;
+        }
+    }
+    check("cv schemes", signed == 3 * 3 + 6);
+    let edk, oke = x509::parse_private_key(field("server", "ed25519", 3));
+    let edleaf, ee = x509::parse(field("server", "ed25519", 2));
+    let edsig, okes = tls::sign(edk, x509::ED25519, raw);
+    check("cv ed25519 refused", oke && ee == x509::OK && okes && !tls::cv_verify12(edleaf, x509::ED25519, log, edsig));
+    check("cv schemes without ed25519", !tls::offered_scheme(tls::CV_SCHEMES12, x509::ED25519));
 }
 
 // ALPN, and certificate failures as in TLS 1.3.
@@ -571,6 +688,7 @@ fn main() {
     versions();
     resumption();
     client_certificates();
+    certificate_verify_schemes();
     alpn_and_failures();
     records();
     key_usage();

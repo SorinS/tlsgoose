@@ -38,6 +38,12 @@ let DOWNGRADE11: u8[8] = [0x44, 0x4f, 0x57, 0x4e, 0x47, 0x52, 0x44, 0x00];
 // since 1.25).
 let SIG_SCHEMES12: u16[10] = [0x0403, 0x0503, 0x0603, 0x0807, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601];
 
+// The schemes of CertificateVerify: not Ed25519, which signs the messages
+// themselves, not a hash of them, so would need them all kept (Go keeps
+// them; a Conn here holds only the hashes, see Log12). TLS 1.3 signs a
+// transcript hash, and takes Ed25519 client certificates.
+let CV_SCHEMES12: u16[9] = [0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601];
+
 // Whether a scheme suits a key in TLS 1.2: RSA with PSS or PKCS #1 v1.5,
 // ECDSA with any of its hashes whatever the curve (§7.4.1.4.1), Ed25519
 // (RFC 8422).
@@ -53,11 +59,41 @@ fn scheme_fits12(kind: i64, s: u16) -> bool {
     return false;
 }
 
-// The scheme to sign with: the peer's first that suits the key, as Go
-// picks it; 0 for none.
-fn pick_scheme12(kind: i64, peer: const u16[:]) -> u16 {
-    for s in peer { if offered_scheme(SIG_SCHEMES12, s) && scheme_fits12(kind, s) { return s; } }
+// The scheme to sign with: the peer's first of ours that suits the key,
+// as Go picks it; 0 for none.
+fn pick_scheme12(kind: i64, peer: const u16[:], ours: const u16[:]) -> u16 {
+    for s in peer { if offered_scheme(ours, s) && scheme_fits12(kind, s) { return s; } }
     return 0;
+}
+
+// A scheme's algorithm, hash and PSS salt length, for CertificateVerify.
+fn cv_alg12(s: u16) -> i64, i64, i64 {
+    if s == x509::ECDSA_SECP256R1_SHA256 { return x509::SIG_ECDSA, 256, 0; }
+    if s == x509::ECDSA_SECP384R1_SHA384 { return x509::SIG_ECDSA, 384, 0; }
+    if s == x509::ECDSA_SECP521R1_SHA512 { return x509::SIG_ECDSA, 512, 0; }
+    if s == x509::RSA_PSS_RSAE_SHA256 { return x509::SIG_RSA_PSS, 256, 32; }
+    if s == x509::RSA_PSS_RSAE_SHA384 { return x509::SIG_RSA_PSS, 384, 48; }
+    if s == x509::RSA_PSS_RSAE_SHA512 { return x509::SIG_RSA_PSS, 512, 64; }
+    if s == x509::RSA_PKCS1_SHA256 { return x509::SIG_RSA_PKCS1, 256, 0; }
+    if s == x509::RSA_PKCS1_SHA384 { return x509::SIG_RSA_PKCS1, 384, 0; }
+    assert(s == x509::RSA_PKCS1_SHA512);
+    return x509::SIG_RSA_PKCS1, 512, 0;
+}
+
+// CertificateVerify's signature over the handshake messages so far, by a
+// scheme of CV_SCHEMES12; false when signing fails.
+fn cv_sign12(key: const x509::PrivateKey&, s: u16, log: const Log12&) -> u8[>..], bool {
+    let alg, h, salt = cv_alg12(s);
+    let sig, ok = x509::sign_digest(key, alg, h, log12_digest(log, h));
+    return sig, ok;
+}
+
+// Whether a CertificateVerify signature is the leaf's, by a scheme of
+// CV_SCHEMES12 that suits its key.
+fn cv_verify12(leaf: const x509::Cert&, s: u16, log: const Log12&, sig: const u8[:]) -> bool {
+    if !offered_scheme(CV_SCHEMES12, s) || !scheme_fits12(leaf.key_type, s) { return false; }
+    let alg, h, salt = cv_alg12(s);
+    return x509::verify_digest(leaf, alg, h, salt, log12_digest(log, h), sig) == x509::OK;
 }
 
 // Whether sig over msg is the leaf's by scheme s.
@@ -249,7 +285,7 @@ fn client_server_hello12(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out
     c.ticket12 = ticket;
     for i in 32 { c.peer_random[i] = m[random.pos + i]; }
     c.th = transcript(s.hash);
-    c.log.clear();
+    c.log = log12();
     hs_add(c, c.ch);
     hs_add(c, m);
     // Resumed: the server sent back the session ID that came with the
@@ -342,7 +378,7 @@ fn client_certificate_request12(c: Conn&, cfg: const ClientConfig&, m: const u8[
         let want: i64 = if cfg.cert_key.kind == x509::KEY_RSA { 1 } else { 64 };     // rsa_sign, ecdsa_sign
         var type_ok = false;
         while types.pos < types.end { if get_u8(types, m) == want { type_ok = true; } }
-        let sch = pick_scheme12(cfg.cert_key.kind, schemes);
+        let sch = pick_scheme12(cfg.cert_key.kind, schemes, CV_SCHEMES12);
         if type_ok && sch != 0 && (cas.end == cas.pos || issued_by_one_of(cfg.cert_chain, m, cas)) { c.cert_scheme = sch; }
     }
     hs_add(c, m);
@@ -395,8 +431,7 @@ fn client_server_hello_done12(c: Conn&, cfg: const ClientConfig&, m: const u8[:]
     send_hs(c, handshake_message(HS_CLIENT_KEY_EXCHANGE, cke), out);
     set48(c.master, master_secret12(c.suite.hash, pms, c.ems, transcript_hash(c.th), c.random, c.peer_random));
     if c.cert_scheme != 0 {
-        if c.log_over { return fail(c, ALERT_INTERNAL_ERROR, out); }
-        let sig, oks = sign(cfg.cert_key, c.cert_scheme, c.log);
+        let sig, oks = cv_sign12(cfg.cert_key, c.cert_scheme, c.log);
         if !oks { return fail(c, ALERT_INTERNAL_ERROR, out); }
         var cv: u8[>..] = [];
         put_u16(cv, c.cert_scheme);
@@ -456,7 +491,6 @@ fn client_finished12(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8
     }
     c.has_session = c.session.ticket.len > 0;
     c.state = ST_CONNECTED;
-    c.log.clear();
     return 0;
 }
 
@@ -497,7 +531,7 @@ fn server_client_hello12(c: Conn&, cfg: const ServerConfig&, m: const u8[:], h: 
     if h.has_reneg && !h.reneg_empty { return fail(c, ALERT_HANDSHAKE_FAILURE, out); }
     c.secure_reneg = h.has_reneg || in_u16_list(m, h.suites, TLS_EMPTY_RENEGOTIATION_INFO_SCSV);
     take_peer_schemes(c, m, h.schemes, SIG_SCHEMES12);
-    let scheme = pick_scheme12(cfg.key.kind, c.peer_schemes);
+    let scheme = pick_scheme12(cfg.key.kind, c.peer_schemes, SIG_SCHEMES12);
     // ECDHE: the server's first ECDH group the client takes, if it takes
     // uncompressed points (as it does without the extension, RFC 8422
     // §5.1.2).
@@ -560,7 +594,7 @@ fn server_client_hello12(c: Conn&, cfg: const ServerConfig&, m: const u8[:], h: 
     c.suite = s;
     c.resumed = resumed;
     c.th = transcript(s.hash);
-    c.log.clear();
+    c.log = log12();
     hs_add(c, m);
     // ServerHello: the client's session ID back when resuming, none
     // otherwise (nothing is kept to resume by ID, as in Go); a TLS 1.3
@@ -650,7 +684,7 @@ fn send_certificate_request12(c: Conn&, cfg: const ServerConfig&, out: u8[>..]&)
     b.push(1);                                      // rsa_sign
     b.push(64);                                     // ecdsa_sign
     let sl = begin_vec(b, 2);
-    for sc in SIG_SCHEMES12 { put_u16(b, sc); }
+    for sc in CV_SCHEMES12 { put_u16(b, sc); }
     patch_len(b, sl, 2);
     let names = client_ca_names(cfg);
     put_u16(b, names.len as! u16);
@@ -752,15 +786,14 @@ fn server_certificate_verify12(c: Conn&, m: const u8[:], out: u8[>..]&) -> i64 {
     let scheme = get_u16(b, m);
     let sig = get_vec(b, m, 2);
     if !done(b) { return fail(c, ALERT_DECODE_ERROR, out); }
-    if !offered_scheme(SIG_SCHEMES12, scheme as! u16) { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
-    if c.log_over { return fail(c, ALERT_INTERNAL_ERROR, out); }
+    if !offered_scheme(CV_SCHEMES12, scheme as! u16) { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
     let leaf, okl = peer_leaf(c);
     if okl && !usage_signs(leaf) {
         c.error = x509::ERR_KEY_USAGE;
         return fail(c, ALERT_BAD_CERTIFICATE, out);
     }
     if okl && !scheme_fits12(leaf.key_type, scheme as! u16) { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
-    if !okl || !verify12(leaf, scheme as! u16, c.log, m[sig.pos..sig.end]) { return fail(c, ALERT_DECRYPT_ERROR, out); }
+    if !okl || !cv_verify12(leaf, scheme as! u16, c.log, m[sig.pos..sig.end]) { return fail(c, ALERT_DECRYPT_ERROR, out); }
     hs_add(c, m);
     c.state = ST12_WAIT_CLIENT_CCS;
     return 0;
@@ -781,7 +814,6 @@ fn server_finished12(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: u8
         send_finished12(c, out);
     }
     c.state = ST_CONNECTED;
-    c.log.clear();
     return 0;
 }
 

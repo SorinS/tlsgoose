@@ -325,12 +325,11 @@ struct Conn {
     // the master secret, extended or not; the peer's random; the peer
     // supports secure renegotiation; a NewSessionTicket comes (the
     // client's view) or goes (the server's); the server's ECDH share; and
-    // the handshake messages so far, which CertificateVerify signs (log_over
-    // once they no longer fit).
+    // the hashes of the handshake messages so far, which CertificateVerify
+    // signs.
     offer12: bool, offer13: bool, session12_offered: bool,
     master: u8[..48], ems: bool, peer_random: u8[32], secure_reneg: bool, ticket12: bool,
-    peer_share: u8[..256], log_over: bool,
-    log: u8[..131072],
+    peer_share: u8[..256], log: Log12,
     ch_inner: u8[..8192],             // the client's first ClientHelloInner, until the hash is known
     ch: u8[..8192],                   // the client's first ClientHello, until the hash is known
     inbuf: u8[..18437],               // one record in arrival
@@ -356,7 +355,7 @@ fn new_conn(is_server: bool, seed: u64) -> Conn {
         ech_ctx: bignum::hpke_empty_context(), ech_kdf: 0, ech_aead: 0, ech_config_id: 0, ech_max_name: 0,
         ech_public_name: [], ech_enc: [], outer_random: [0; 32], ech_retry: [], th_inner: transcript(256),
         offer12: false, offer13: false, session12_offered: false, master: [], ems: false, peer_random: [0; 32],
-        secure_reneg: false, ticket12: false, peer_share: [], log_over: false, log: [],
+        secure_reneg: false, ticket12: false, peer_share: [], log: log12(),
         ch_inner: [], ch: [], inbuf: [], hs: [], chain: [],
     };
     var seed_bytes: u8[32] = [0; 32];
@@ -501,7 +500,7 @@ fn done(r: const Rd&) -> bool { !r.bad && r.pos == r.end }
 // Sends a handshake message: into the transcript, then into a record.
 fn send_hs(c: Conn&, msg: const u8[:], out: u8[>..]&) {
     transcript_add(c.th, msg);
-    if c.version == VERSION_TLS12 { log_add(c, msg); }
+    if c.version == VERSION_TLS12 { log12_add(c.log, msg); }
     if c.write_protected {
         out.append(seal_records(c.write, CT_HANDSHAKE, msg));
     } else {
@@ -512,16 +511,10 @@ fn send_hs(c: Conn&, msg: const u8[:], out: u8[>..]&) {
     }
 }
 
-// TLS 1.2's record of the handshake messages, for CertificateVerify.
-fn log_add(c: Conn&, msg: const u8[:]) {
-    if c.log.len + msg.len > c.log.cap { c.log_over = true; return; }
-    c.log.append(msg);
-}
-
-// A received handshake message, into the transcript (and TLS 1.2's log).
+// A handshake message, into the transcript (and TLS 1.2's log).
 fn hs_add(c: Conn&, msg: const u8[:]) {
     transcript_add(c.th, msg);
-    if c.version == VERSION_TLS12 { log_add(c, msg); }
+    if c.version == VERSION_TLS12 { log12_add(c.log, msg); }
 }
 
 fn send_ccs(c: Conn&, out: u8[>..]&) {

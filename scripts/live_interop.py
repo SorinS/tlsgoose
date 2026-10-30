@@ -447,12 +447,21 @@ def main():
         dict(tls12, name="TLS 1.2 goose client, wrong host name", role="client", cert="p256", host="other.org",
              want=False, goose_alert=42),
     ]
-    for kind in ("client_p256", "client_ed25519"):
+    for kind in ("client_p256",):
         cases.append(dict(tls12, name=f"TLS 1.2 goose client sends a certificate ({kind[7:]})", role="client",
                           cert="rsa", goose_cert=kind, py_verify="required", want=True, want_openssl_peer=kind))
         cases.append(dict(tls12, name=f"TLS 1.2 goose server requires and checks: OpenSSL client's {kind[7:]}",
                           role="server", cert="p256", py_cert=kind, goose_client_auth=4, want=True, want_peer=True,
                           want_verified=True))
+    # No Ed25519 client certificates in TLS 1.2 (README): the goose client
+    # sends none, and this server does not offer the scheme, so OpenSSL's
+    # client sends none either.
+    cases += [
+        dict(tls12, name="TLS 1.2 goose client with an Ed25519 key sends no certificate", role="client",
+             cert="rsa", goose_cert="client_ed25519", py_verify="required", want=False),
+        dict(tls12, name="TLS 1.2 goose server requires one: OpenSSL client's Ed25519 is not offered", role="server",
+             cert="p256", py_cert="client_ed25519", goose_client_auth=4, want=False, goose_alert=42),
+    ]
     cases += [
         dict(tls12, name="TLS 1.2 goose client without a certificate, one required", role="client", cert="p256",
              py_verify="required", want=False),
