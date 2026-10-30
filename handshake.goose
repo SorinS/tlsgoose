@@ -508,7 +508,7 @@ fn send_hs(c: Conn&, msg: const u8[:], out: u8[>..]&) {
         // 0x0301 only on the first ClientHello (§5.1), which does not come
         // here; a second one after a HelloRetryRequest has 0x0303, as Go
         // insists.
-        out.append(plain_record(CT_HANDSHAKE, msg, 0x0303));
+        out.append(plain_records(CT_HANDSHAKE, msg, 0x0303));
     }
 }
 
@@ -1105,7 +1105,7 @@ fn client_start(c: Conn&, cfg: const ClientConfig&, out: u8[>..]&) {
     let ch, inner = build_client_hello(c, cfg, cfg.groups[0], "");
     c.ch.append(ch);
     c.ch_inner.append(inner);
-    out.append(plain_record(CT_HANDSHAKE, ch, 0x0301));
+    out.append(plain_records(CT_HANDSHAKE, ch, 0x0301));
     c.state = ST_WAIT_SH;
 }
 

@@ -221,6 +221,21 @@ fn plain_record(ctype: u8, payload: const u8[:], version: u16 = 0x0303) -> u8[>.
     return out;
 }
 
+// Plaintext records for data of any length: fragments of at most
+// MAX_FRAGMENT bytes (§5.1), as a long handshake message (TLS 1.2's
+// Certificate, say) needs.
+fn plain_records(ctype: u8, data: const u8[:], version: u16 = 0x0303) -> u8[>..] {
+    var out: u8[>..] = [];
+    var off = 0;
+    loop {
+        let n = ::min(MAX_FRAGMENT, data.len - off);
+        out.append(plain_record(ctype, data[off..off + n], version));
+        off += n;
+        if off >= data.len { break; }
+    }
+    return out;
+}
+
 // Protects one record (TLSCiphertext): payload, its real content type and
 // `padding` zero bytes are encrypted under an outer type of
 // application_data, with the record header as additional data.
