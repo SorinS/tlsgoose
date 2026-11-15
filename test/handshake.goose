@@ -6,9 +6,9 @@
 // a wrong name, a changed record, no common suite or group.
 import std;
 import tls from "..";
-import bignum from "../../bigmongoose.git";
-import asn1 from "../../asn1goose.git";
-import x509 from "../../x509goose.git";
+import bignum from "SorinS/bigmongoose@v0.7.0";
+import asn1 from "SorinS/asn1goose@v0.7.0";
+import x509 from "SorinS/x509goose@v0.7.0";
 import tls.handshake;
 import x509.pool;
 
@@ -419,7 +419,241 @@ fn records() {
     check("byte at a time", tls::connected(c4) && tls::connected(s4));
 }
 
+// --- Strictness (RFC 8446), with messages made here ---------------------------
+
+fn put16(b: u8[>..]&, v: i64) { b.push((v >> 8) as! u8); b.push(v as! u8); }
+
+fn put_ext(b: u8[>..]&, ty: i64, body: const u8[:]) { put16(b, ty); put16(b, body.len); b.append(body); }
+
+// A key_share entry for X25519 (the base point as the key).
+fn x25519_entry() -> u8[>..] {
+    var e: u8[>..] = [0, 0x1d, 0, 32, 9];
+    for i in 31 { e.push(0); }
+    return e;
+}
+
+// A plaintext handshake record of one message.
+fn hs_record(ty: u8, body: const u8[:]) -> u8[>..] {
+    var r: u8[>..] = [22, 3, 3];
+    put16(r, body.len + 4);
+    r.push(ty);
+    r.push((body.len >> 16) as! u8);
+    put16(r, body.len);
+    r.append(body);
+    return r;
+}
+
+// A TLS 1.3 ClientHello offering TLS_AES_128_GCM_SHA256, X25519 and
+// Ed25519, with key_share entries `shares` and the extensions `more`.
+fn client_hello(shares: const u8[:], more: const u8[:]) -> u8[>..] {
+    var b: u8[>..] = [3, 3];
+    for i in 32 { b.push(i as! u8); }
+    b.append([0, 0, 2, 0x13, 0x01, 1, 0]);
+    var exts: u8[>..] = [];
+    put_ext(exts, 43, [2, 3, 4]);
+    put_ext(exts, 10, [0, 2, 0, 0x1d]);
+    put_ext(exts, 13, [0, 2, 8, 7]);
+    var ks: u8[>..] = [];
+    put16(ks, shares.len);
+    ks.append(shares);
+    put_ext(exts, 51, ks);
+    exts.append(more);
+    put16(b, exts.len);
+    b.append(exts);
+    return hs_record(1, b);
+}
+
+fn sni_ext(n: i64) -> u8[>..] {
+    var body: u8[>..] = [];
+    put16(body, n + 3);
+    body.push(0);
+    put16(body, n);
+    for i in n { body.push('a'); }
+    var e: u8[>..] = [];
+    put_ext(e, 0, body);
+    return e;
+}
+
+// What a server makes of a record: its alert (0 for none).
+fn server_alert(rec: const u8[:]) -> u8 {
+    let sc = server_cfg("ed25519");
+    var s = tls::server(sc);
+    var out: u8[>..] = [];
+    var app: u8[>..] = [];
+    let r = tls::server_feed(s, sc, rec, out, app);
+    return s.alert;
+}
+
+fn server_strictness() {
+    let one = x25519_entry();
+    check("made ClientHello: taken", server_alert(client_hello(one, "")) == 0);
+    var two: u8[>..] = [];
+    two.append(one);
+    two.append(one);
+    check("key_share with a group twice: illegal_parameter",
+          server_alert(client_hello(two, "")) == tls::ALERT_ILLEGAL_PARAMETER);
+    check("SNI of 255 bytes: taken", server_alert(client_hello(one, sni_ext(255))) == 0);
+    check("SNI of 256 bytes: decode_error", server_alert(client_hello(one, sni_ext(256))) == tls::ALERT_DECODE_ERROR);
+    let ccs: u8[6] = [20, 3, 3, 0, 1, 1];
+    check("change_cipher_spec before ClientHello: unexpected_message",
+          server_alert(ccs) == tls::ALERT_UNEXPECTED_MESSAGE);
+    var ccs_after = client_hello(one, "");
+    let n = ccs_after.len;
+    ccs_after.append(ccs);
+    check("change_cipher_spec after it: taken", server_alert(ccs_after) == 0);
+}
+
+// The client's state and alert after a server's flight up to its
+// ServerHello, then EncryptedExtensions and a CertificateRequest made
+// here (with `ctx` as its context, `sigs` as signature_algorithms' data),
+// sealed under the server's handshake keys.
+fn certificate_request_case(ctx: const u8[:], sigs: const u8[:]) -> i64, u8 {
+    let cc = client_cfg();
+    let sc = server_cfg("ed25519");
+    var c = tls::client(cc);
+    var s = tls::server(sc);
+    var ts: u8[>..] = [];
+    var tc: u8[>..] = [];
+    var app: u8[>..] = [];
+    tls::client_start(c, cc, ts);
+    let rs = tls::server_feed(s, sc, ts, tc, app);
+    let n = 5 + ((tc[3] as i64) << 8 | tc[4]);
+    ts.clear();
+    let rc = tls::client_feed(c, cc, tc[..n], ts, app);
+    var k = tls::record_keys(s.suite, s.sch.s_hs);
+    let ee: u8[2] = [0, 0];
+    var flight: u8[>..] = [];
+    flight.append(tls::seal_record(k, tls::CT_HANDSHAKE, tls::handshake_message(tls::HS_ENCRYPTED_EXTENSIONS, ee)));
+    var cr: u8[>..] = [];
+    cr.push(ctx.len as! u8);
+    cr.append(ctx);
+    var exts: u8[>..] = [];
+    put_ext(exts, 13, sigs);
+    put16(cr, exts.len);
+    cr.append(exts);
+    flight.append(tls::seal_record(k, tls::CT_HANDSHAKE, tls::handshake_message(tls::HS_CERTIFICATE_REQUEST, cr)));
+    let r = tls::client_feed(c, cc, flight, ts, app);
+    return c.state, c.alert;
+}
+
+// Offsets of a ClientHello record's extension of type `ty`: its data's
+// start and end (0, 0 for none).
+fn hello_ext(rec: const u8[:], ty: i64) -> i64, i64 {
+    var p = 9 + 2 + 32;
+    p += 1 + rec[p];
+    p += 2 + ((rec[p] as i64) << 8 | rec[p + 1]);
+    p += 1 + rec[p];
+    let end = p + 2 + ((rec[p] as i64) << 8 | rec[p + 1]);
+    p += 2;
+    while p < end {
+        let t = (rec[p] as i64) << 8 | rec[p + 1];
+        let l = (rec[p + 2] as i64) << 8 | rec[p + 3];
+        if t == ty { return p + 4, p + 4 + l; }
+        p += 4 + l;
+    }
+    return 0, 0;
+}
+
+// A HelloRetryRequest to a client, with the extensions `exts` after
+// supported_versions.
+fn hrr_record(c: const tls::Conn&, exts: const u8[:]) -> u8[>..] {
+    var b: u8[>..] = [3, 3];
+    b.append(tls::HRR_RANDOM);
+    b.push(c.session_id.len as! u8);
+    b.append(c.session_id);
+    b.append([0x13, 0x01, 0]);
+    var e: u8[>..] = [];
+    put_ext(e, 43, [3, 4]);
+    e.append(exts);
+    put16(b, e.len);
+    b.append(e);
+    return hs_record(2, b);
+}
+
+fn client_strictness() {
+    // Checking the certificate needs a name.
+    var nameless = client_cfg();
+    nameless.server_name.clear();
+    var c0 = tls::client(nameless);
+    var out0: u8[>..] = [];
+    tls::client_start(c0, nameless, out0);
+    check("verify with no server name: refused", tls::failed(c0) && c0.alert == tls::ALERT_INTERNAL_ERROR && out0.len == 0);
+    nameless.verify = false;
+    var c1 = tls::client(nameless);
+    out0.clear();
+    tls::client_start(c1, nameless, out0);
+    check("no server name, not verifying: starts", !tls::failed(c1) && out0.len > 0);
+
+    // CertificateRequest in the handshake: an empty context and a whole,
+    // non-empty list of schemes.
+    let st1, a1 = certificate_request_case("", [0, 2, 8, 7]);
+    check("certificate request: taken", st1 == tls::ST_WAIT_CERT && a1 == 0);
+    let st2, a2 = certificate_request_case([0x55], [0, 2, 8, 7]);
+    check("certificate request with a context: illegal_parameter", a2 == tls::ALERT_ILLEGAL_PARAMETER);
+    let st3, a3 = certificate_request_case("", [0, 3, 8, 7, 4]);
+    check("odd-length signature list: decode_error", a3 == tls::ALERT_DECODE_ERROR);
+    let st4, a4 = certificate_request_case("", [0, 0]);
+    check("empty signature list: decode_error", a4 == tls::ALERT_DECODE_ERROR);
+
+    // A HelloRetryRequest with a cookie and no key_share (a server keeping
+    // no state): the second ClientHello has the cookie and the first's
+    // shares, as they were.
+    let cc = client_cfg();
+    var c = tls::client(cc);
+    var ch1: u8[>..] = [];
+    tls::client_start(c, cc, ch1);
+    var cookie: u8[>..] = [];
+    put_ext(cookie, 44, [0, 3, 'a', 'b', 'c']);
+    var out: u8[>..] = [];
+    var app: u8[>..] = [];
+    let r = tls::client_feed(c, cc, hrr_record(c, cookie), out, app);
+    check("cookie-only HelloRetryRequest: taken", r == 0 && c.hrr && !tls::failed(c) && out.len > 6 && out[0] == 20);
+    if r == 0 && out.len > 6 {
+        let ch2 = out[6..];
+        let k1, k1e = hello_ext(ch1, 51);
+        let k2, k2e = hello_ext(ch2, 51);
+        let q, qe = hello_ext(ch2, 44);
+        check("the same shares", k1e > k1 && ch1[k1..k1e] == ch2[k2..k2e]);
+        let want: u8[5] = [0, 3, 'a', 'b', 'c'];
+        check("the cookie back", ch2[q..qe] == want[..]);
+    }
+    // One with neither a group nor a cookie would change nothing.
+    var c2 = tls::client(cc);
+    var ch: u8[>..] = [];
+    tls::client_start(c2, cc, ch);
+    out.clear();
+    let r2 = tls::client_feed(c2, cc, hrr_record(c2, ""), out, app);
+    check("empty HelloRetryRequest: illegal_parameter", r2 == -1 && c2.alert == tls::ALERT_ILLEGAL_PARAMETER);
+}
+
+// Secrets are forgotten once a connection fails or closes.
+fn secrets_wiped() {
+    let cc = client_cfg();
+    let sc = server_cfg("ed25519");
+    var c = tls::client(cc);
+    var s = tls::server(sc);
+    var ts: u8[>..] = [];
+    var capp: u8[>..] = [];
+    var sapp: u8[>..] = [];
+    tls::client_start(c, cc, ts);
+    pump(c, cc, s, sc, ts, capp, sapp);
+    let zeros: u8[32] = [0; 32];
+    check("secrets before close", tls::connected(c) && c.sch.c_ap[..] != zeros[..]);
+    tls::close(c, ts);
+    check("client closed: secrets gone", c.sch.c_ap[..] == zeros[..] && c.sch.master[..] == zeros[..] && c.x25519_sk[..] == zeros[..]);
+    pump(c, cc, s, sc, ts, capp, sapp);
+    var back: u8[>..] = [];
+    tls::close(s, back);
+    check("server closed after the peer: secrets gone", tls::closed(s) && back.len > 0 && s.sch.s_ap[..] == zeros[..]);
+    var again: u8[>..] = [];
+    tls::close(c, again);
+    check("closed twice: nothing more sent", again.len == 0);
+}
+
 fn main() {
+    server_strictness();
+    client_strictness();
+    secrets_wiped();
     suites_and_groups();
     mlkem_groups();
     hybrid_defaults();

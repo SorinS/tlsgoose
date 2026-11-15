@@ -279,7 +279,10 @@ fn seal_records(k: RecordKeys&, ctype: u8, data: const u8[:]) -> u8[>..] {
 // the alert to send when it fails (0 for none). The sequence number moves
 // on only for a record that opened.
 fn open_record(k: RecordKeys&, rec: const u8[:]) -> u8, u8[>..], u8 {
-    if k.v12 { return open_record12(k, rec); }
+    if k.v12 {
+        let ct, pt, alert = open_record12(k, rec);
+        return ct, pt, alert;
+    }
     var out: u8[>..] = [];
     if rec.len < 5 || rec[0] != CT_APPLICATION_DATA || rec[1] != 3 || rec[2] != 3 {
         return 0, out, ALERT_UNEXPECTED_MESSAGE;

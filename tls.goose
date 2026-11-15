@@ -8,9 +8,9 @@
 namespace tls;
 
 import std;
-import bignum from "../bigmongoose.git";
-import asn1 from "../asn1goose.git";
-import x509 from "../x509goose.git";
+import bignum from "SorinS/bigmongoose@v0.7.0";
+import asn1 from "SorinS/asn1goose@v0.7.0";
+import x509 from "SorinS/x509goose@v0.7.0";
 
 // Record content types (RFC 8446 §5.1).
 let CT_CHANGE_CIPHER_SPEC: u8 = 20;

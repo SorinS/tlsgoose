@@ -12,9 +12,9 @@
 // - keyUsage against what the key does, in TLS 1.3 and 1.2.
 import std;
 import tls from "..";
-import bignum from "../../bigmongoose.git";
-import asn1 from "../../asn1goose.git";
-import x509 from "../../x509goose.git";
+import bignum from "SorinS/bigmongoose@v0.7.0";
+import asn1 from "SorinS/asn1goose@v0.7.0";
+import x509 from "SorinS/x509goose@v0.7.0";
 import tls.handshake;
 import tls.session;
 import tls.record;
@@ -330,6 +330,14 @@ fn resumption() {
         var out2: u8[>..] = [];
         tls::client_start(c2, other, out2);
         check("roots replaced: not offered", !c2.session12_offered);
+        // The server resumes a session only for the name it was made for.
+        var renamed = copy(nv);
+        renamed.session.server_name.clear();
+        renamed.session.server_name.append("other.example");
+        renamed.server_name.clear();
+        renamed.server_name.append("other.example");
+        let o3 = connect(renamed, sc);
+        check("another name: full handshake", o3.ok && !o3.resumed);
     }
 }
 

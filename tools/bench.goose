@@ -12,9 +12,9 @@
 //   goose build -o bench tools/bench.goose && ./bench [prefix] [ms]
 import std;
 import tls from "..";
-import bignum from "../../bigmongoose.git";
-import asn1 from "../../asn1goose.git";
-import x509 from "../../x509goose.git";
+import bignum from "SorinS/bigmongoose@v0.7.0";
+import asn1 from "SorinS/asn1goose@v0.7.0";
+import x509 from "SorinS/x509goose@v0.7.0";
 import tls.handshake;
 import tls.session;
 

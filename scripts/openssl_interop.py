@@ -110,7 +110,7 @@ def main():
         return
     with tempfile.TemporaryDirectory() as tmp:
         subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt",
-                        "ec_paramgen_curve:P-256", "-nodes", "-subj", "/CN=localhost",
+                        "ec_paramgen_curve:P-256", "-pkeyopt", "ec_param_enc:named_curve", "-nodes", "-subj", "/CN=localhost",
                         "-addext", "subjectAltName=DNS:localhost", "-days", "30",
                         "-keyout", os.path.join(tmp, "key.pem"),
                         "-out", os.path.join(tmp, "cert.pem")], check=True, capture_output=True)

@@ -12,14 +12,15 @@
 //
 // Supported: the three cipher suites; the post-quantum X25519MLKEM768,
 // SecP256r1MLKEM768, SecP384r1MLKEM1024 and MLKEM1024, and X25519, P-256,
-// P-384 and P-521 key exchange with
+// P-384, P-521, X448 and the Brainpool curves (RFC 8734) key exchange with
 // HelloRetryRequest; server certificates checked by x509
 // (chain, host name, CertificateVerify) with RSA-PSS, RSA PKCS #1 v1.5,
-// ECDSA, Ed25519 and ML-DSA; client certificates, requested and checked as
-// Go's ClientAuth modes do; Encrypted Client Hello (tls.ech) both ways; ALPN; KeyUpdate; middlebox compatibility mode;
+// ECDSA (Brainpool too), Ed25519, Ed448 and ML-DSA; client certificates,
+// requested and checked as Go's ClientAuth modes do; Encrypted Client Hello (tls.ech) both ways; ALPN; KeyUpdate; middlebox compatibility mode;
 // resumption with tickets (psk_dhe_ke, tls.session). TLS 1.2 too, as Go
 // has it, negotiated with TLS 1.3 by default (min_version, max_version):
-// ECDHE with ECDSA, Ed25519 or RSA certificates, RSA key exchange when
+// ECDHE (X448 and RFC 7027's Brainpool groups too) with ECDSA, Ed25519,
+// Ed448 or RSA certificates, RSA key exchange when
 // its suites are configured, AES-GCM, ChaCha20-Poly1305 and AES-CBC,
 // extended master secret, secure renegotiation's extension (renegotiation
 // itself is refused), session tickets, client certificates, and the
@@ -64,6 +65,16 @@ let GROUP_X25519MLKEM768: u16 = 0x11ec;
 let GROUP_SECP256R1MLKEM768: u16 = 0x11eb;
 let GROUP_SECP384R1MLKEM1024: u16 = 0x11ed;
 let GROUP_MLKEM1024: u16 = 0x0202;
+// X448 (RFC 8446, RFC 8422), in both versions; the Brainpool curves for
+// TLS 1.3 (RFC 8734), and their TLS 1.2 code points (RFC 7027), which TLS
+// 1.3 does not take.
+let GROUP_X448: u16 = 0x001e;
+let GROUP_BRAINPOOLP256R1TLS13: u16 = 0x001f;
+let GROUP_BRAINPOOLP384R1TLS13: u16 = 0x0020;
+let GROUP_BRAINPOOLP512R1TLS13: u16 = 0x0021;
+let GROUP_BRAINPOOLP256R1: u16 = 26;
+let GROUP_BRAINPOOLP384R1: u16 = 27;
+let GROUP_BRAINPOOLP512R1: u16 = 28;
 
 // Extension types.
 let EXT_SERVER_NAME: u16 = 0;
@@ -138,9 +149,10 @@ let HRR_RANDOM: u8[32] = [
 ];
 
 // The signature schemes offered and accepted, most preferred first: ML-DSA
-// (draft-ietf-tls-mldsa) first, as Go has them.
-let SIG_SCHEMES: u16[13] = [0x0904, 0x0905, 0x0906, 0x0403, 0x0503, 0x0603, 0x0807, 0x0804, 0x0805, 0x0806,
-                            0x0401, 0x0501, 0x0601];
+// (draft-ietf-tls-mldsa) first, as Go has them; then ECDSA, the Brainpool
+// curves' TLS 1.3 schemes (RFC 8734), Ed25519 and Ed448, RSA.
+let SIG_SCHEMES: u16[17] = [0x0904, 0x0905, 0x0906, 0x0403, 0x0503, 0x0603, 0x081a, 0x081b, 0x081c, 0x0807, 0x0808,
+                            0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601];
 
 // A handshake message's body, at most (Go's maxHandshake); its 4-byte header
 // comes on top.
@@ -156,7 +168,10 @@ let MAX_EARLY_SKIP: i64 = 1 << 16;
 // What a client needs: the name it connects to (SNI and the certificate
 // check), whether to check the certificate, the time for that check (0:
 // now), the versions it takes (TLS 1.2 and 1.3 by default, as Go), its
-// groups (the first gets a key share), TLS 1.3 and TLS 1.2 suites and ALPN
+// groups (the first gets a key share; X448 and the Brainpool ones come last
+// by default, named in supported_groups for a server that wants them but
+// with no share of their own; the TLS 1.2 Brainpool ones only if added),
+// TLS 1.3 and TLS 1.2 suites and ALPN
 // protocols, a DRBG seed for tests (0: the OS's entropy), a session to
 // resume (from tls::session of an earlier connection; none when its
 // ticket is empty), a certificate chain (concatenated DER, the leaf first;
@@ -167,7 +182,7 @@ let MAX_EARLY_SKIP: i64 = 1 << 16;
 // (x509::system_roots), or a pool of its own when system_roots is false.
 struct ClientConfig {
     server_name: u8[..255], verify: bool, now: i64, min_version: u16, max_version: u16,
-    groups: u16[..8], suites: u16[..8], suites12: u16[..24], alpn: u8[..255], seed: u64,
+    groups: u16[..16], suites: u16[..8], suites12: u16[..24], alpn: u8[..255], seed: u64,
     session: Session,
     cert_key: x509::PrivateKey, cert_chain: u8[..65536],
     ech_config_list: u8[..8192],
@@ -181,7 +196,8 @@ fn client_config(server_name: const u8[:], roots: const u8[:]) -> ClientConfig {
     var c = ClientConfig {
         server_name: [], verify: true, now: 0, min_version: VERSION_TLS12, max_version: VERSION_TLS13,
         groups: [GROUP_X25519MLKEM768, GROUP_SECP256R1MLKEM768, GROUP_SECP384R1MLKEM1024, GROUP_X25519,
-                 GROUP_SECP256R1, GROUP_SECP384R1, GROUP_SECP521R1],
+                 GROUP_SECP256R1, GROUP_SECP384R1, GROUP_SECP521R1, GROUP_X448, GROUP_BRAINPOOLP256R1TLS13,
+                 GROUP_BRAINPOOLP384R1TLS13, GROUP_BRAINPOOLP512R1TLS13],
         suites: [TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256],
         suites12: [], alpn: [], seed: 0, session: no_session(), cert_key: x509::empty_key(), cert_chain: [], ech_config_list: [],
         system_roots: roots.len == 0, roots: x509::new_pool(),
@@ -244,7 +260,9 @@ fn add_alpn(list: u8[..255]&, proto: const u8[:]) {
 }
 
 // What a server needs: its private key (one of x509's KEY_* types), the
-// versions it takes (TLS 1.2 and 1.3 by default), its groups, TLS 1.3 and
+// versions it takes (TLS 1.2 and 1.3 by default), its groups (X448 and the
+// TLS 1.3 Brainpool ones last by default, taken when a client offers
+// nothing earlier; the TLS 1.2 Brainpool ones only if added), TLS 1.3 and
 // TLS 1.2 suites (the RSA key exchange ones only if added, as in Go) and
 // ALPN protocols in order of preference, a DRBG seed,
 // the time (0: now), how many session tickets to send after a handshake
@@ -257,7 +275,7 @@ fn add_alpn(list: u8[..255]&, proto: const u8[:]) {
 // when there are none, as Go does), and its ECH keys (add_ech_key).
 struct ServerConfig {
     key: x509::PrivateKey, min_version: u16, max_version: u16,
-    groups: u16[..8], suites: u16[..8], suites12: u16[..24], alpn: u8[..255], seed: u64, now: i64,
+    groups: u16[..16], suites: u16[..8], suites12: u16[..24], alpn: u8[..255], seed: u64, now: i64,
     tickets: i64, ticket_key: u8[32],
     chain: u8[..65536],
     client_auth: i64,
@@ -266,13 +284,15 @@ struct ServerConfig {
 }
 
 // A server configuration from a chain (concatenated DER) and a private key
-// in DER: PKCS #8 (RSA, EC or Ed25519), SEC 1 (EC) or PKCS #1 (RSA).
+// in DER: PKCS #8 (RSA, EC, Ed25519, Ed448 or ML-DSA), SEC 1 (EC) or
+// PKCS #1 (RSA).
 fn server_config(chain: const u8[:], key_der: const u8[:]) -> ServerConfig, bool {
     let k, ok = x509::parse_private_key(key_der);
     var s = ServerConfig {
         key: k, min_version: VERSION_TLS12, max_version: VERSION_TLS13,
         groups: [GROUP_X25519MLKEM768, GROUP_SECP256R1MLKEM768, GROUP_SECP384R1MLKEM1024, GROUP_X25519,
-                 GROUP_SECP256R1, GROUP_SECP384R1, GROUP_SECP521R1],
+                 GROUP_SECP256R1, GROUP_SECP384R1, GROUP_SECP521R1, GROUP_X448, GROUP_BRAINPOOLP256R1TLS13,
+                 GROUP_BRAINPOOLP384R1TLS13, GROUP_BRAINPOOLP512R1TLS13],
         suites: [TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256],
         suites12: [], alpn: [], seed: 0, now: 0, tickets: 1, ticket_key: [0; 32], chain: [],
         client_auth: NO_CLIENT_CERT, ech_keys: [], client_cas: x509::new_pool(),
@@ -298,6 +318,7 @@ struct Conn {
     x25519_sk: u8[32], ec_sk: u8[..66], mlkem_seed: u8[64],
     hrr: bool, ccs_sent: bool, cert_requested: bool, cr_context: u8[..255],
     ccs_seen: bool,                   // TLS 1.3: the peer's one change_cipher_spec came
+    wiped: bool,                      // the secrets are forgotten (wipe)
     useless: i64,                     // records in a row that carried nothing (warnings, empty data)
     skip_early: bool, early_skipped: i64,  // the server skips the 0-RTT data it refused, and how much
     ch1_digest: u8[32],               // the server's: what of the first ClientHello the second must repeat
@@ -348,7 +369,7 @@ fn new_conn(is_server: bool, seed: u64) -> Conn {
         read: record_keys(s, zero), write: record_keys(s, zero), read_protected: false, write_protected: false,
         drbg_k: [0; 32], drbg_v: [1; 32], random: [0; 32], session_id: [],
         group: 0, group2: 0, x25519_sk: [0; 32], ec_sk: [], mlkem_seed: [0; 64], hrr: false, ccs_sent: false, cert_requested: false,
-        ccs_seen: false, useless: 0, skip_early: false, early_skipped: 0, ch1_digest: [0; 32], client_version: 0,
+        ccs_seen: false, wiped: false, useless: 0, skip_early: false, early_skipped: 0, ch1_digest: [0; 32], client_version: 0,
         cr_context: [], cert_scheme: 0, peer_verified: false, peer_schemes: [], alpn: [], sni: [], tickets: 0, key_updates: 0,
         psk_offered: false, resumed: false, psk_dhe: false, peer_not_after: 0, has_session: false, session: no_session(),
         ech_offered: false, ech_seen: false, ech_confirm: false, ech_accepted: false, ech_backend: false,
@@ -524,6 +545,30 @@ fn send_ccs(c: Conn&, out: u8[>..]&) {
     c.ccs_sent = true;
 }
 
+fn zero(b: u8[:]) { for i in b.len { b[i] = 0; } }
+
+// The read keys, forgotten: the peer sent close_notify (the
+// close_notify back still needs the write keys).
+fn wipe_read(c: Conn&) {
+    var zs: u8[32] = [0; 32];
+    c.read = record_keys(c.suite, zs);
+}
+
+// Every secret the connection holds, forgotten once it can neither send
+// nor receive (failed, or closed by close): the key schedule, the record
+// keys, the key exchange's private keys, TLS 1.2's master secret, ECH's
+// HPKE context and the DRBG. The session (tls::session) stays.
+fn wipe(c: Conn&) {
+    zero(c.sch.early); zero(c.sch.handshake); zero(c.sch.master); zero(c.sch.c_hs); zero(c.sch.s_hs);
+    zero(c.sch.c_ap); zero(c.sch.s_ap); zero(c.sch.exporter); zero(c.sch.resumption);
+    zero(c.x25519_sk); zero(c.ec_sk); zero(c.mlkem_seed); zero(c.master); zero(c.drbg_k); zero(c.drbg_v);
+    var zs: u8[32] = [0; 32];
+    c.read = record_keys(c.suite, zs);
+    c.write = record_keys(c.suite, zs);
+    c.ech_ctx = bignum::hpke_empty_context();
+    c.wiped = true;
+}
+
 // Fails the connection: the alert goes out (protected when keys exist).
 fn fail(c: Conn&, desc: u8, out: u8[>..]&) -> i64 {
     if c.state == ST_FAILED { return -1; }
@@ -532,6 +577,7 @@ fn fail(c: Conn&, desc: u8, out: u8[>..]&) -> i64 {
     else { out.append(plain_record(CT_ALERT, a)); }
     c.alert = desc;
     c.state = ST_FAILED;
+    wipe(c);
     return -1;
 }
 
@@ -542,12 +588,14 @@ fn send(c: Conn&, data: const u8[:], out: u8[>..]&) -> bool {
     return true;
 }
 
-// close_notify; the connection sends nothing after it.
+// close_notify; the connection sends nothing after it, and once closed
+// forgets its secrets.
 fn close(c: Conn&, out: u8[>..]&) {
-    if !c.write_protected || c.state == ST_FAILED { return; }
+    if !c.write_protected || c.state == ST_FAILED || c.wiped { return; }
     let a = alert(ALERT_WARNING, ALERT_CLOSE_NOTIFY);
     out.append(seal_record(c.write, CT_ALERT, a));
     if c.state == ST_CONNECTED { c.state = ST_CLOSED; }
+    if c.state == ST_CLOSED { wipe(c); }
 }
 
 fn update_write(c: Conn&) {
@@ -572,8 +620,16 @@ fn key_update(c: Conn&, request: bool, out: u8[>..]&) -> bool {
 
 // --- Key exchange -----------------------------------------------------------
 
+// The curve of a group of the short Weierstrass kind: a NIST or Brainpool
+// one (the Brainpool curves have a code point for each version).
 fn curve_of(group: u16) -> bignum::Curve {
-    if group == GROUP_SECP256R1 { bignum::p256() } else if group == GROUP_SECP384R1 { bignum::p384() } else { bignum::p521() }
+    if group == GROUP_SECP256R1 { return bignum::p256(); }
+    if group == GROUP_SECP384R1 { return bignum::p384(); }
+    if group == GROUP_BRAINPOOLP256R1TLS13 || group == GROUP_BRAINPOOLP256R1 { return bignum::bp256(); }
+    if group == GROUP_BRAINPOOLP384R1TLS13 || group == GROUP_BRAINPOOLP384R1 { return bignum::bp384(); }
+    if group == GROUP_BRAINPOOLP512R1TLS13 || group == GROUP_BRAINPOOLP512R1 { return bignum::bp512(); }
+    assert(group == GROUP_SECP521R1);
+    return bignum::p521();
 }
 
 // A group's ML-KEM parameter k (3 for ML-KEM-768, 4 for ML-KEM-1024), 0
@@ -594,18 +650,29 @@ fn ecdh_part(group: u16) -> u16 {
 // The length of an ECDH share, and of ML-KEM's encapsulation key and
 // ciphertext.
 fn ecdh_len(g: u16) -> i64 {
-    if g == 0 { 0 } else if g == GROUP_X25519 { 32 } else if g == GROUP_SECP256R1 { 65 }
-    else if g == GROUP_SECP384R1 { 97 } else { 133 }
+    if g == 0 { return 0; }
+    if g == GROUP_X25519 { return 32; }
+    if g == GROUP_X448 { return 56; }
+    if g == GROUP_SECP521R1 { return 133; }
+    return 1 + 2 * curve_of(g).len;
 }
 
 fn mlkem_ek_len(k: i64) -> i64 { 384 * k + 32 }
 fn mlkem_ct_len(k: i64) -> i64 { if k == 3 { 1088 } else { 1568 } }
 
-// A fresh ECDH key for group g (X25519 or a NIST curve); its public value.
+// A fresh ECDH key for group g (X25519, X448, a NIST or Brainpool curve);
+// its public value. X448's key, like a curve's, goes in ec_sk.
 fn make_ecdh(c: Conn&, g: u16) -> u8[>..] {
     if g == GROUP_X25519 {
         drbg_fill(c, c.x25519_sk);
         return bignum::x25519_base(c.x25519_sk);
+    }
+    if g == GROUP_X448 {
+        var k: u8[56] = [0; 56];
+        drbg_fill(c, k);
+        c.ec_sk.clear();
+        c.ec_sk.append(k);
+        return bignum::x448_base(k);
     }
     let curve = curve_of(g);
     var sk: u8[>..] = [];
@@ -622,6 +689,7 @@ fn make_ecdh(c: Conn&, g: u16) -> u8[>..] {
 
 fn ecdh_public(c: const Conn&, g: u16) -> u8[>..] {
     if g == GROUP_X25519 { return bignum::x25519_base(c.x25519_sk); }
+    if g == GROUP_X448 { return bignum::x448_base(c.ec_sk); }
     let curve = curve_of(g);
     return bignum::ec_public_key(curve, c.ec_sk);
 }
@@ -631,6 +699,11 @@ fn ecdh_secret(c: const Conn&, g: u16, peer: const u8[:]) -> u8[>..], bool {
     if peer.len != ecdh_len(g) { return out, false; }
     if g == GROUP_X25519 {
         let s, ok = bignum::x25519_shared(c.x25519_sk, peer);
+        out.append(s);
+        return out, ok;
+    }
+    if g == GROUP_X448 {
+        let s, ok = bignum::x448_shared(c.ec_sk, peer);
         out.append(s);
         return out, ok;
     }
@@ -677,7 +750,10 @@ fn make_share(c: Conn&, group: u16) -> u8[>..] {
 // the ECDH secret, in the share's order.
 fn shared_secret(c: const Conn&, peer: const u8[:]) -> u8[>..], bool {
     let k = mlkem_k(c.group);
-    if k == 0 { return ecdh_secret(c, c.group, peer); }
+    if k == 0 {
+        let s, ok = ecdh_secret(c, c.group, peer);
+        return s, ok;
+    }
     let g = ecdh_part(c.group);
     var out: u8[>..] = [];
     if peer.len != mlkem_ct_len(k) + ecdh_len(g) { return out, false; }
@@ -688,9 +764,21 @@ fn shared_secret(c: const Conn&, peer: const u8[:]) -> u8[>..], bool {
     return hybrid_join(c.group, s1, s2), ok1 && ok2;
 }
 
-fn known_group(g: i64) -> bool {
-    g == GROUP_X25519 || g == GROUP_SECP256R1 || g == GROUP_SECP384R1 || g == GROUP_SECP521R1 ||
+fn known_group(g: i64) -> bool { group13(g) || group12(g) }
+
+// The groups of TLS 1.3: ML-KEM's and the ECDH ones, the Brainpool curves
+// under their TLS 1.3 code points (RFC 8734).
+fn group13(g: i64) -> bool {
+    g == GROUP_X25519 || g == GROUP_SECP256R1 || g == GROUP_SECP384R1 || g == GROUP_SECP521R1 || g == GROUP_X448 ||
+        g == GROUP_BRAINPOOLP256R1TLS13 || g == GROUP_BRAINPOOLP384R1TLS13 || g == GROUP_BRAINPOOLP512R1TLS13 ||
         g == GROUP_X25519MLKEM768 || g == GROUP_SECP256R1MLKEM768 || g == GROUP_SECP384R1MLKEM1024 || g == GROUP_MLKEM1024
+}
+
+// The groups of TLS 1.2's ECDHE: no ML-KEM, and the Brainpool curves under
+// their TLS 1.2 code points (RFC 7027).
+fn group12(g: i64) -> bool {
+    g == GROUP_X25519 || g == GROUP_SECP256R1 || g == GROUP_SECP384R1 || g == GROUP_SECP521R1 || g == GROUP_X448 ||
+        g == GROUP_BRAINPOOLP256R1 || g == GROUP_BRAINPOOLP384R1 || g == GROUP_BRAINPOOLP512R1
 }
 
 // The server's share and the shared secret, from the client's share. For
@@ -738,8 +826,9 @@ fn offered_scheme(list: const u16[:], s: u16) -> bool {
 // The scheme to sign CertificateVerify with, for a key and the peer's list;
 // 0 for none.
 // Whether a TLS 1.3 CertificateVerify may use a scheme with a key: RSA
-// with PSS only, ECDSA with its curve's hash, Ed25519 and ML-DSA with
-// their own (RFC 8446 §4.2.3, §4.4.3).
+// with PSS only, ECDSA with its curve's scheme (the Brainpool curves with
+// RFC 8734's), Ed25519, Ed448 and ML-DSA with their own (RFC 8446 §4.2.3,
+// §4.4.3).
 fn scheme_fits13(kind: i64, s: u16) -> bool {
     if kind == x509::KEY_RSA {
         return s == x509::RSA_PSS_RSAE_SHA256 || s == x509::RSA_PSS_RSAE_SHA384 || s == x509::RSA_PSS_RSAE_SHA512;
@@ -747,13 +836,18 @@ fn scheme_fits13(kind: i64, s: u16) -> bool {
     if kind == x509::KEY_EC_P256 { return s == x509::ECDSA_SECP256R1_SHA256; }
     if kind == x509::KEY_EC_P384 { return s == x509::ECDSA_SECP384R1_SHA384; }
     if kind == x509::KEY_EC_P521 { return s == x509::ECDSA_SECP521R1_SHA512; }
+    if kind == x509::KEY_EC_BP256 { return s == x509::ECDSA_BRAINPOOLP256R1TLS13_SHA256; }
+    if kind == x509::KEY_EC_BP384 { return s == x509::ECDSA_BRAINPOOLP384R1TLS13_SHA384; }
+    if kind == x509::KEY_EC_BP512 { return s == x509::ECDSA_BRAINPOOLP512R1TLS13_SHA512; }
     if kind == x509::KEY_ED25519 { return s == x509::ED25519; }
+    if kind == x509::KEY_ED448 { return s == x509::ED448; }
     if x509::is_mldsa(kind) { return s == x509::mldsa_scheme(x509::mldsa_set(kind)); }
     return false;
 }
 
 fn pick_scheme(key: const x509::PrivateKey&, peer: const u16[:]) -> u16 {
     if key.kind == x509::KEY_ED25519 && offered_scheme(peer, x509::ED25519) { return x509::ED25519; }
+    if key.kind == x509::KEY_ED448 && offered_scheme(peer, x509::ED448) { return x509::ED448; }
     if x509::is_mldsa(key.kind) {
         let s = x509::mldsa_scheme(x509::mldsa_set(key.kind));
         if offered_scheme(peer, s) { return s; }
@@ -761,6 +855,10 @@ fn pick_scheme(key: const x509::PrivateKey&, peer: const u16[:]) -> u16 {
     if key.kind == x509::KEY_EC_P256 && offered_scheme(peer, x509::ECDSA_SECP256R1_SHA256) { return x509::ECDSA_SECP256R1_SHA256; }
     if key.kind == x509::KEY_EC_P384 && offered_scheme(peer, x509::ECDSA_SECP384R1_SHA384) { return x509::ECDSA_SECP384R1_SHA384; }
     if key.kind == x509::KEY_EC_P521 && offered_scheme(peer, x509::ECDSA_SECP521R1_SHA512) { return x509::ECDSA_SECP521R1_SHA512; }
+    for s in [x509::ECDSA_BRAINPOOLP256R1TLS13_SHA256, x509::ECDSA_BRAINPOOLP384R1TLS13_SHA384,
+              x509::ECDSA_BRAINPOOLP512R1TLS13_SHA512] {
+        if scheme_fits13(key.kind, s) && offered_scheme(peer, s) { return s; }
+    }
     if key.kind == x509::KEY_RSA {
         for s in [x509::RSA_PSS_RSAE_SHA256, x509::RSA_PSS_RSAE_SHA384, x509::RSA_PSS_RSAE_SHA512] {
             if offered_scheme(peer, s) { return s; }
@@ -775,13 +873,23 @@ fn sign(key: const x509::PrivateKey&, scheme: u16, msg: const u8[:]) -> u8[>..],
     var alg = x509::SIG_RSA_PSS;
     var h: i64 = 512;
     if scheme == x509::ED25519 { alg = x509::SIG_ED25519; h = 0; }
+    else if scheme == x509::ED448 { alg = x509::SIG_ED448; h = 0; }
     else if scheme == x509::MLDSA44 || scheme == x509::MLDSA65 || scheme == x509::MLDSA87 {
         alg = x509::SIG_MLDSA;
         h = x509::mldsa_set(key.kind);
     }
-    else if scheme == x509::ECDSA_SECP256R1_SHA256 { alg = x509::SIG_ECDSA; h = 256; }
-    else if scheme == x509::ECDSA_SECP384R1_SHA384 { alg = x509::SIG_ECDSA; h = 384; }
-    else if scheme == x509::ECDSA_SECP521R1_SHA512 { alg = x509::SIG_ECDSA; h = 512; }
+    else if scheme == x509::ECDSA_SECP256R1_SHA256 || scheme == x509::ECDSA_BRAINPOOLP256R1TLS13_SHA256 {
+        alg = x509::SIG_ECDSA;
+        h = 256;
+    }
+    else if scheme == x509::ECDSA_SECP384R1_SHA384 || scheme == x509::ECDSA_BRAINPOOLP384R1TLS13_SHA384 {
+        alg = x509::SIG_ECDSA;
+        h = 384;
+    }
+    else if scheme == x509::ECDSA_SECP521R1_SHA512 || scheme == x509::ECDSA_BRAINPOOLP512R1TLS13_SHA512 {
+        alg = x509::SIG_ECDSA;
+        h = 512;
+    }
     else if scheme == x509::RSA_PKCS1_SHA256 { alg = x509::SIG_RSA_PKCS1; h = 256; }
     else if scheme == x509::RSA_PKCS1_SHA384 { alg = x509::SIG_RSA_PKCS1; h = 384; }
     else if scheme == x509::RSA_PKCS1_SHA512 { alg = x509::SIG_RSA_PKCS1; h = 512; }
@@ -802,14 +910,39 @@ fn cert_alert(e: i64) -> u8 {
 
 // --- The client -------------------------------------------------------------
 
+// The public value of the client's share for a group it made one for
+// (make_share), again: ML-KEM's key from its seed, ECDH's from its key.
+fn share_public(c: const Conn&, group: u16) -> u8[>..] {
+    let k = mlkem_k(group);
+    if k == 0 { return ecdh_public(c, group); }
+    let ek, dk = bignum::mlkem_keys_from_seed(k, c.mlkem_seed);
+    let g = ecdh_part(group);
+    var e: u8[>..] = [];
+    if g != 0 { e = ecdh_public(c, g); }
+    return hybrid_join(group, ek, e);
+}
+
 // The client's key_share list: a share for `share_group`, and beside a
 // hybrid a share of its ECDH part with the same key (as Go sends), for
 // servers without ML-KEM; not after a HelloRetryRequest, which allows only
-// the share it asked for.
+// the share it asked for. `share_group` 0, after a HelloRetryRequest that
+// named no group (a cookie alone), repeats the first ClientHello's shares
+// as they were (§4.1.2).
 fn client_shares(c: Conn&, cfg: const ClientConfig&, share_group: u16) -> u8[>..] {
     var b: u8[>..] = [];
     if !c.offer13 { return b; }
     let kl = begin_vec(b, 2);
+    if share_group == 0 {
+        for g in [c.group, c.group2] {
+            if g == 0 { continue; }
+            let pub = share_public(c, g);
+            put_u16(b, g);
+            put_u16(b, pub.len as! u16);
+            b.append(pub);
+        }
+        patch_len(b, kl, 2);
+        return b;
+    }
     put_u16(b, share_group);
     let pubkey = make_share(c, share_group);
     put_u16(b, pubkey.len as! u16);
@@ -889,12 +1022,13 @@ fn hello_message(c: const Conn&, cfg: const ClientConfig&, sni: const u8[:], ran
             if c.offer12 { put_u16(b, VERSION_TLS12); }
             patch_len(b, sv, 2);
         }
-        // Without TLS 1.3, none of its groups (ML-KEM) or schemes (ML-DSA),
-        // as Go leaves them out; some servers refuse a TLS 1.2 hello with
-        // them.
+        // Without TLS 1.3, none of its groups (ML-KEM, its Brainpool code
+        // points) or schemes (ML-DSA), as Go leaves them out; some servers
+        // refuse a TLS 1.2 hello with them. Without TLS 1.2, none of its
+        // Brainpool code points.
         let sg = begin_ext(b, EXT_SUPPORTED_GROUPS);
         let gl = begin_vec(b, 2);
-        for g in cfg.groups { if c.offer13 || mlkem_k(g) == 0 { put_u16(b, g); } }
+        for g in cfg.groups { if (c.offer13 && group13(g)) || (c.offer12 && group12(g)) { put_u16(b, g); } }
         patch_len(b, gl, 2);
         patch_len(b, sg, 2);
         let sa = begin_ext(b, EXT_SIGNATURE_ALGORITHMS);
@@ -1045,7 +1179,11 @@ fn client_start(c: Conn&, cfg: const ClientConfig&, out: u8[>..]&) {
     c.offer13 = cfg.max_version >= VERSION_TLS13 && cfg.min_version <= VERSION_TLS13 && cfg.suites.len > 0;
     c.offer12 = cfg.min_version <= VERSION_TLS12 && cfg.max_version >= VERSION_TLS12 && cfg.suites12.len > 0 &&
                 cfg.ech_config_list.len == 0;
-    if !c.offer13 && !c.offer12 || (cfg.ech_config_list.len > 0 && !c.offer13) {
+    // Checking the certificate needs a name to check it for: with none,
+    // the client refuses to start, as Go does ("either ServerName or
+    // InsecureSkipVerify must be specified").
+    if !c.offer13 && !c.offer12 || (cfg.ech_config_list.len > 0 && !c.offer13) ||
+       (cfg.verify && cfg.server_name.len == 0) {
         c.alert = ALERT_INTERNAL_ERROR;
         c.state = ST_FAILED;
         return;
@@ -1095,7 +1233,15 @@ fn client_start(c: Conn&, cfg: const ClientConfig&, out: u8[>..]&) {
         c.ech_public_name.append(ec.public_name);
         drbg_fill(c, c.outer_random);
     }
-    let ch, inner = build_client_hello(c, cfg, cfg.groups[0], "");
+    // The key share: the first group TLS 1.3 takes.
+    var share_group: u16 = 0;
+    for g in cfg.groups { if share_group == 0 && group13(g) { share_group = g; } }
+    if c.offer13 && share_group == 0 {
+        c.alert = ALERT_INTERNAL_ERROR;
+        c.state = ST_FAILED;
+        return;
+    }
+    let ch, inner = build_client_hello(c, cfg, share_group, "");
     c.ch.append(ch);
     c.ch_inner.append(inner);
     out.append(plain_records(CT_HANDSHAKE, ch, 0x0301));
@@ -1140,6 +1286,7 @@ fn client_server_hello(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: 
     var share_group = -1;
     var share = Rd { pos: 0, end: 0, bad: false };
     var cookie = Rd { pos: 0, end: 0, bad: false };
+    var has_cookie = false;
     var psk_selected = -1;
     var ech_hrr = empty_rd();
     var has_ech_hrr = false;
@@ -1154,6 +1301,7 @@ fn client_server_hello(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: 
             if !is_hrr { share = get_vec(e, m, 2); }
         } else if ty == EXT_COOKIE && is_hrr {
             cookie = get_vec(e, m, 2);
+            has_cookie = !cookie.bad && cookie.end > cookie.pos;
         } else if ty == EXT_PRE_SHARED_KEY && !is_hrr && c.psk_offered {
             psk_selected = get_u16(e, m);
         } else if ty == EXT_ENCRYPTED_CLIENT_HELLO && is_hrr && c.ech_offered {
@@ -1167,9 +1315,14 @@ fn client_server_hello(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: 
     if version != 0x0304 { return fail(c, ALERT_PROTOCOL_VERSION, out); }
     c.version = VERSION_TLS13;
     if is_hrr {
+        // A group to retry with, one offered but not shared; or none, the
+        // shares staying as they were, when it brings a cookie (a server
+        // that keeps no state, OpenSSL's -stateless); a retry that would
+        // change nothing is refused (§4.1.4).
         var known = false;
-        for g in cfg.groups { if g == share_group { known = true; } }
-        if c.hrr || !known || share_group == c.group || share_group == c.group2 {
+        for g in cfg.groups { if g == share_group && group13(g) { known = true; } }
+        let cookie_only = share_group < 0 && has_cookie;
+        if c.hrr || (!known && !cookie_only) || share_group == c.group || share_group == c.group2 {
             return fail(c, ALERT_ILLEGAL_PARAMETER, out);
         }
         c.hrr = true;
@@ -1203,7 +1356,7 @@ fn client_server_hello(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: 
         send_ccs(c, out);
         var ck: u8[>..] = [];
         ck.append(m[cookie.pos..cookie.end]);
-        let ch2, inner2 = build_client_hello(c, cfg, share_group as! u16, ck);
+        let ch2, inner2 = build_client_hello(c, cfg, if cookie_only { 0 } else { share_group as! u16 }, ck);
         send_hs(c, ch2, out);
         if c.ech_offered { transcript_add(c.th_inner, inner2); }
         return 0;
@@ -1385,6 +1538,7 @@ fn check_server_chain(c: Conn&, cfg: const ClientConfig&, out: u8[>..]&) -> i64 
         // (§6.1.7).
         var name: u8[>..] = [];
         name.append(if c.ech_offered && !c.ech_accepted { c.ech_public_name[..] } else { cfg.server_name[..] });
+        if name.len == 0 { return fail(c, ALERT_INTERNAL_ERROR, out); }
         let e = server_chain_error(cfg, c.chain, name);
         if e != x509::OK {
             c.error = e;
@@ -1440,6 +1594,9 @@ fn client_certificate_request(c: Conn&, cfg: const ClientConfig&, m: const u8[:]
     let ctx = get_vec(b, m, 1);
     var exts = get_vec(b, m, 2);
     if !done(b) { return fail(c, ALERT_DECODE_ERROR, out); }
+    // In the handshake its context is empty (§4.3.2); a context is for
+    // post-handshake authentication, which this client does not offer.
+    if ctx.end != ctx.pos { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
     var schemes: u16[..64] = [];
     var has_schemes = false;
     var cas = empty_rd();
@@ -1450,6 +1607,8 @@ fn client_certificate_request(c: Conn&, cfg: const ClientConfig&, m: const u8[:]
         if exts.bad { return fail(c, ALERT_DECODE_ERROR, out); }
         if ty == EXT_SIGNATURE_ALGORITHMS {
             var l = get_vec(e, m, 2);
+            // A whole, non-empty list of two-byte schemes (§4.2.3).
+            if l.end == l.pos || (l.end - l.pos) % 2 != 0 { return fail(c, ALERT_DECODE_ERROR, out); }
             while l.pos + 1 < l.end {
                 let v = get_u16(l, m);
                 if schemes.len < schemes.cap { schemes.push(v as! u16); }
@@ -1732,12 +1891,18 @@ fn parse_hello(m: const u8[:]) -> Hello, bool {
         } else if ty == EXT_KEY_SHARE {
             h.shares = get_vec(e, m, 2);
             h.has_shares = true;
-            // Each entry whole: a group and a non-empty key.
+            // Each entry whole: a group and a non-empty key; no group
+            // twice (§4.2.8: illegal_parameter).
             var l = h.shares;
+            var groups: u64[1024] = [0; 1024];
             while l.pos < l.end {
                 let g = get_u16(l, m);
                 let k = get_vec(l, m, 2);
                 if k.end == k.pos { l.bad = true; }
+                if l.bad { break; }
+                let bit: u64 = 1 << (g & 63);
+                if groups[g >> 6] & bit != 0 { h.alert = ALERT_ILLEGAL_PARAMETER; return h, false; }
+                groups[g >> 6] = groups[g >> 6] | bit;
             }
             if l.bad { return h, false; }
         } else if ty == EXT_SIGNATURE_ALGORITHMS {
@@ -1754,6 +1919,9 @@ fn parse_hello(m: const u8[:]) -> Hello, bool {
                 let kind = get_u8(l, m);
                 let name = get_vec(l, m, 2);
                 if l.bad || name.end == name.pos { return h, false; }
+                // A host name longer than a DNS name can be (and than the
+                // 255 bytes kept of it) is refused, not cut.
+                if kind == 0 && name.end - name.pos > 255 { return h, false; }
                 if kind == 0 {
                     names++;
                     h.sni = name;
@@ -1777,7 +1945,7 @@ fn parse_hello(m: const u8[:]) -> Hello, bool {
             h.cookie = get_vec(e, m, 2);
         } else if ty == EXT_PSK_KEY_EXCHANGE_MODES {
             var l = get_vec(e, m, 1);
-            while l.pos < l.end { if get_u8(l, m) == PSK_DHE_KE as i64 { h.psk_dhe = true; } }
+            while l.pos < l.end { if get_u8(l, m) == PSK_DHE_KE { h.psk_dhe = true; } }
             if l.bad { return h, false; }
         } else if ty == EXT_PRE_SHARED_KEY {
             // The last extension (§4.2.11).
@@ -2067,11 +2235,11 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
     for g in cfg.groups {
         if group != 0 { break; }
         let k, found = find_share(h, m, g);
-        if found && in_u16_list(m, h.groups, g) { group = g; share = k; }
+        if found && group13(g) && in_u16_list(m, h.groups, g) { group = g; share = k; }
     }
     if group == 0 {
         var fallback: u16 = 0;
-        for g in cfg.groups { if fallback == 0 && in_u16_list(m, h.groups, g) { fallback = g; } }
+        for g in cfg.groups { if fallback == 0 && group13(g) && in_u16_list(m, h.groups, g) { fallback = g; } }
         if fallback == 0 || second { return fail(c, if second { ALERT_ILLEGAL_PARAMETER } else { ALERT_HANDSHAKE_FAILURE }, out); }
         c.session_id.clear();
         c.session_id.append(m[h.sid.pos..h.sid.end]);
@@ -2094,14 +2262,15 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
     let scheme = pick_scheme(cfg.key, c.peer_schemes);
     if select_alpn(c, cfg, h, m, out) != 0 { return -1; }
     c.sni.clear();
-    if h.sni.end - h.sni.pos <= 255 { c.sni.append(m[h.sni.pos..h.sni.end]); }
+    c.sni.append(m[h.sni.pos..h.sni.end]);       // at most 255 bytes (parse_hello)
     if !second {
         c.session_id.clear();
         c.session_id.append(m[h.sid.pos..h.sid.end]);
         c.th = transcript(s.hash);
     }
     // Resumption: the first identity that is a ticket of ours, unexpired,
-    // for a suite of this hash; its binder must then be right.
+    // for a suite of this hash and the name the session was made for
+    // (another name gets a full handshake); its binder must then be right.
     var psk: u8[>..] = [];
     var psk_identity = -1;
     c.psk_dhe = h.psk_dhe;
@@ -2116,7 +2285,7 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
             let t, okt = open_ticket(cfg.ticket_key, m[id.pos..id.end]);
             let ts, okts = suite(t.suite);
             if okt && okts && t.version == VERSION_TLS13 && ts.hash == s.hash && now >= t.created && now - t.created <= t.lifetime &&
-               ticket_client_ok(cfg, t, now) {
+               t.sni[..] == c.sni[..] && ticket_client_ok(cfg, t, now) {
                 psk_identity = idx;
                 psk.append(t.psk);
                 // The client's certificate, carried over.
@@ -2414,9 +2583,13 @@ fn post_handshake(c: Conn&, m: const u8[:], out: u8[>..]&) -> i64 {
     return fail(c, ALERT_UNEXPECTED_MESSAGE, out);
 }
 
-// One whole record.
-fn handle_record(c: Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&, rec: const u8[:],
-                 out: u8[>..]&, app: u8[>..]&) -> i64 {
+// A handshake message to the side whose configuration cfg is.
+fn role_message(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8[>..]&) -> i64 { client_message(c, cfg, m, out) }
+fn role_message(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: u8[>..]&) -> i64 { server_message(c, cfg, m, out) }
+
+// One whole record. cfg is the side's own configuration, a ClientConfig or
+// a ServerConfig: this and feed are compiled once for each.
+fn handle_record(c: Conn&, cfg, rec: const u8[:], out: u8[>..]&, app: u8[>..]&) -> i64 {
     let outer = rec[0];
     var ctype = outer;
     var payload: u8[>..] = [];
@@ -2425,8 +2598,12 @@ fn handle_record(c: Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&,
         // TLS 1.2's turns on the peer's keys, at the end of a flight.
         if c.version == VERSION_TLS12 { return change_cipher_spec12(c, out); }
         // Middlebox compatibility: one byte 1, once, only during the
-        // handshake (and not between a handshake message's fragments).
-        if c.state == ST_CONNECTED || c.ccs_seen || c.hs.len > 0 { return fail(c, ALERT_UNEXPECTED_MESSAGE, out); }
+        // handshake, after the first ClientHello (§5: not before the
+        // server has one), and not between a handshake message's
+        // fragments.
+        if c.state == ST_CONNECTED || c.ccs_seen || c.hs.len > 0 || c.state == ST_WAIT_CH || c.state == ST_START {
+            return fail(c, ALERT_UNEXPECTED_MESSAGE, out);
+        }
         c.ccs_seen = true;
         return 0;
     }
@@ -2436,6 +2613,7 @@ fn handle_record(c: Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&,
         // protect its alert: a plaintext fatal alert ends the handshake.
         c.alert = rec[6];
         c.state = ST_FAILED;
+        wipe(c);
         return -1;
     }
     if c.read_protected {
@@ -2485,6 +2663,7 @@ fn handle_record(c: Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&,
         if c.version == VERSION_TLS12 && payload[0] == ALERT_WARNING && payload[1] != ALERT_CLOSE_NOTIFY { return 0; }
         c.alert = payload[1];
         c.state = if payload[1] == ALERT_CLOSE_NOTIFY { ST_CLOSED } else { ST_FAILED };
+        if c.state == ST_FAILED { wipe(c); } else { wipe_read(c); }
         return if c.state == ST_CLOSED { 0 } else { -1 };
     }
     if ctype == CT_APPLICATION_DATA {
@@ -2508,7 +2687,7 @@ fn handle_record(c: Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&,
         var rest: u8[..65540] = [];
         rest.append(c.hs[n..]);
         c.hs = rest;
-        let r = if c.is_server { server_message(c, scfg, msg, out) } else { client_message(c, ccfg, msg, out) };
+        let r = role_message(c, cfg, msg, out);
         if r != 0 { return r; }
         // A change of read keys (after ServerHello) must fall at a record boundary.
         if c.hs.len > 0 && c.state == ST_WAIT_EE { return fail(c, ALERT_UNEXPECTED_MESSAGE, out); }
@@ -2523,8 +2702,7 @@ fn handle_record(c: Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&,
 // Feeds received bytes; appends what to send to `out` and application
 // data to `app`. Returns 0, or -1 once the connection has failed (the
 // alert, already in `out` when it was ours, is in c.alert).
-fn feed(c: Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&, input: const u8[:],
-        out: u8[>..]&, app: u8[>..]&) -> i64 {
+fn feed(c: Conn&, cfg, input: const u8[:], out: u8[>..]&, app: u8[>..]&) -> i64 {
     var off = 0;
     while off < input.len {
         if c.state == ST_FAILED { return -1; }
@@ -2547,32 +2725,16 @@ fn feed(c: Conn&, ccfg: const ClientConfig&, scfg: const ServerConfig&, input: c
         var rec: u8[>..] = [];
         rec.append(c.inbuf);
         c.inbuf.clear();
-        let r = handle_record(c, ccfg, scfg, rec, out, app);
+        let r = handle_record(c, cfg, rec, out, app);
         if r != 0 { return r; }
     }
     return if c.state == ST_FAILED { -1 } else { 0 };
 }
 
-fn no_server() -> ServerConfig {
-    ServerConfig { key: x509::empty_key(), min_version: VERSION_TLS12, max_version: VERSION_TLS13, groups: [], suites: [],
-                   suites12: [], alpn: [], seed: 0, now: 0, tickets: 0,
-                   ticket_key: [0; 32], chain: [], client_auth: NO_CLIENT_CERT, ech_keys: [],
-                   client_cas: x509::new_pool() }
-}
-
-fn no_client() -> ClientConfig {
-    ClientConfig { server_name: [], verify: false, now: 0, min_version: VERSION_TLS12, max_version: VERSION_TLS13,
-                   groups: [], suites: [], suites12: [], alpn: [], seed: 0,
-                   session: no_session(), cert_key: x509::empty_key(), cert_chain: [], ech_config_list: [],
-                   system_roots: false, roots: x509::new_pool() }
-}
-
 fn client_feed(c: Conn&, cfg: const ClientConfig&, input: const u8[:], out: u8[>..]&, app: u8[>..]&) -> i64 {
-    let none = no_server();
-    return feed(c, cfg, none, input, out, app);
+    return feed(c, cfg, input, out, app);
 }
 
 fn server_feed(c: Conn&, cfg: const ServerConfig&, input: const u8[:], out: u8[>..]&, app: u8[>..]&) -> i64 {
-    let none = no_client();
-    return feed(c, none, cfg, input, out, app);
+    return feed(c, cfg, input, out, app);
 }

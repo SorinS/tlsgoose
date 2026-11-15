@@ -18,7 +18,11 @@ ways: every suite (ECDHE with each certificate type, RSA key exchange,
 GCM, ChaCha20-Poly1305 and CBC), each group, version negotiation with an
 OpenSSL that stops at either version, resumption with session tickets
 (with and without the extended master secret), client certificates and
-ALPN.
+ALPN. X448, the Brainpool curves (RFC 8734) and Ed448: Ed448 and
+Brainpool certificates both ways, under their TLS 1.3 schemes, each group
+alone and by a retry, client certificates; in TLS 1.2, Ed448 and X448
+(OpenSSL 4.1 has no TLS 1.2 Brainpool groups, and so refuses Brainpool
+server certificates there).
 
     python3 scripts/live_interop.py [--goose PATH]
 """
@@ -35,7 +39,8 @@ VEC = os.path.join(ROOT, "test", "vectors")
 SUITES = {"1301": "TLS_AES_128_GCM_SHA256", "1302": "TLS_AES_256_GCM_SHA384",
           "1303": "TLS_CHACHA20_POLY1305_SHA256"}
 GROUPS = {"001d": "X25519", "0017": "P-256", "0018": "P-384", "0019": "P-521", "11ec": "X25519MLKEM768",
-          "11eb": "SecP256r1MLKEM768", "11ed": "SecP384r1MLKEM1024", "0202": "MLKEM1024"}
+          "11eb": "SecP256r1MLKEM768", "11ed": "SecP384r1MLKEM1024", "0202": "MLKEM1024", "001e": "X448",
+          "001f": "brainpoolP256r1tls13", "0020": "brainpoolP384r1tls13", "0021": "brainpoolP512r1tls13"}
 
 
 class Peer:
@@ -379,6 +384,36 @@ def main():
         dict(name="goose server requests: another CA's certificate, unchecked", role="server", cert="rsa",
              py_cert="p384", goose_client_auth=1, want=True, want_peer=True, want_verified=False),
     ]
+    # X448, the Brainpool curves and Ed448: Ed448 and Brainpool
+    # certificates both ways (ed448, ecdsa_brainpoolP*r1tls13_sha*), each
+    # new group alone both ways, retries to them, and client certificates.
+    for cert in ("ed448", "bp256", "bp384", "bp512"):
+        cases.append(dict(name=f"goose client, {cert} server", role="client", cert=cert, want=True, want_group=0x11ec))
+        cases.append(dict(name=f"goose {cert} server", role="server", cert=cert, want=True, want_group=0x11ec))
+    for g, cert in (("001e", "ed448"), ("001f", "bp256"), ("0020", "bp384"), ("0021", "bp512")):
+        cases.append(dict(name=f"goose client, {GROUPS[g]}", role="client", cert=cert, goose_groups=[g],
+                          openssl_groups=GROUPS[g], want=True, want_group=int(g, 16)))
+        cases.append(dict(name=f"goose server, {GROUPS[g]}", role="server", cert=cert, goose_groups=[g],
+                          openssl_groups=GROUPS[g], want=True, want_group=int(g, 16)))
+    cases += [
+        dict(name="goose client, defaults: HelloRetryRequest to X448", role="client", cert="p256",
+             openssl_groups="X448", want=True, want_group=0x001e),
+        dict(name="goose client, defaults: HelloRetryRequest to brainpoolP384r1tls13", role="client", cert="ed448",
+             openssl_groups="brainpoolP384r1tls13", want=True, want_group=0x0020),
+        dict(name="goose server, defaults: OpenSSL client with X448 only", role="server", cert="bp256",
+             openssl_groups="X448", want=True, want_group=0x001e),
+        dict(name="goose server wants X448: HelloRetryRequest from OpenSSL's shares", role="server", cert="p256",
+             goose_groups=["001e"], want=True, want_group=0x001e),
+        dict(name="goose server wants brainpoolP256r1tls13: HelloRetryRequest", role="server", cert="bp256",
+             goose_groups=["001f"], openssl_groups="X25519:brainpoolP256r1tls13", want=True, want_group=0x001f),
+        dict(name="goose client, brainpoolP256r1tls13 only, OpenSSL server without it", role="client", cert="p256",
+             goose_groups=["001f"], openssl_groups="X25519:P-256", want=False),
+    ]
+    for kind in ("client_ed448", "client_bp256"):
+        cases.append(dict(name=f"goose client sends a certificate ({kind[7:]})", role="client", cert="bp384",
+                          goose_cert=kind, py_verify="required", want=True, want_openssl_peer=kind))
+        cases.append(dict(name=f"goose server requires and checks: OpenSSL client's {kind[7:]}", role="server",
+                          cert="ed448", py_cert=kind, goose_client_auth=4, want=True, want_peer=True, want_verified=True))
     # TLS 1.2: OpenSSL takes TLS 1.2 only; every suite, both ways.
     tls12 = dict(py_versions=("1.2", "1.2"), want_version="0303")
     ec12 = [("c02b", "ECDHE-ECDSA-AES128-GCM-SHA256"), ("c02c", "ECDHE-ECDSA-AES256-GCM-SHA384"),
@@ -469,6 +504,40 @@ def main():
              cert="p256", goose_client_auth=4, want=False, goose_alert=42),
         dict(tls12, name="TLS 1.2 goose server checks if given, OpenSSL client has none", role="server", cert="rsa",
              goose_client_auth=3, want=True, want_peer=False, want_verified=False),
+    ]
+    # TLS 1.2 with the new curves: Ed448 certificates, X448 both ways, and
+    # OpenSSL's Brainpool client certificate (ECDSA with SHA-256, the
+    # scheme naming only the hash in TLS 1.2); Ed448 client certificates
+    # are not in TLS 1.2 here, as Ed25519's. OpenSSL 4.1 has no TLS 1.2
+    # Brainpool groups (26-28), and without them it neither serves nor
+    # takes a Brainpool server certificate in TLS 1.2, nor takes a
+    # Brainpool client certificate (as between two OpenSSLs): those cases
+    # fail on OpenSSL's side, and test/curves.goose has them between this
+    # package's client and server.
+    for cert in ("ed448",):
+        for role in ("client", "server"):
+            who = f"goose client, {cert} server" if role == "client" else f"goose {cert} server"
+            cases.append(dict(tls12, name=f"TLS 1.2 {who}, ECDHE-ECDSA-AES128-GCM-SHA256", role=role, cert=cert,
+                              goose_suites=["c02b"], py_ciphers="ECDHE-ECDSA-AES128-GCM-SHA256:@SECLEVEL=0", want=True,
+                              suite="ECDHE-ECDSA-AES128-GCM-SHA256"))
+    cases += [
+        dict(tls12, name="TLS 1.2 goose client, X448", role="client", cert="p256", goose_groups=["001e", "0017"],
+             openssl_groups="X448:P-256", want=True, want_group=0x001e),
+        dict(tls12, name="TLS 1.2 goose server, X448", role="server", cert="rsa", goose_groups=["001e"],
+             want=True, want_group=0x001e),
+        dict(tls12, name="TLS 1.2 goose bp256 server: OpenSSL client refuses the curve", role="server", cert="bp256",
+             goose_suites=["c02b"], py_ciphers="ECDHE-ECDSA-AES128-GCM-SHA256:@SECLEVEL=0", want=False),
+        dict(tls12, name="TLS 1.2 goose client, OpenSSL server will not serve its bp256 certificate", role="client",
+             cert="bp256", py_ciphers="ECDHE-ECDSA-AES128-GCM-SHA256:@SECLEVEL=0", want=False, goose_alert=40,
+             want_version=None),
+        dict(tls12, name="TLS 1.2 goose client's bp256 certificate: OpenSSL server refuses the curve", role="client",
+             cert="rsa", goose_cert="client_bp256", py_verify="required", want=False),
+        dict(tls12, name="TLS 1.2 goose server requires and checks: OpenSSL client's bp256", role="server",
+             cert="p256", py_cert="client_bp256", goose_client_auth=4, want=True, want_peer=True, want_verified=True),
+        dict(tls12, name="TLS 1.2 goose client with an Ed448 key sends no certificate", role="client",
+             cert="rsa", goose_cert="client_ed448", py_verify="required", want=False),
+        dict(tls12, name="TLS 1.2 goose server requires one: OpenSSL client's Ed448 is not offered", role="server",
+             cert="p256", py_cert="client_ed448", goose_client_auth=4, want=False, goose_alert=42),
     ]
     passed = 0
     for case in cases:

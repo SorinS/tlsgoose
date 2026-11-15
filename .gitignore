@@ -9,3 +9,6 @@ test/*
 !tools/bench_openssl.c
 __pycache__/
 __pycache__/
+!test/timing/
+test/timing/*
+!test/timing/*.goose

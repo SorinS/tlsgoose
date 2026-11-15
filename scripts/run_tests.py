@@ -20,7 +20,8 @@ import sys
 import tempfile
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
-EXAMPLE_ARGS = {}
+# None: the example needs a live server, so it is only type-checked.
+EXAMPLE_ARGS = {"https_get": None}
 
 
 def find_goose(arg):
@@ -53,6 +54,7 @@ def main():
 
     test_dir = os.path.join(ROOT, "test")
     tests = sorted(f for f in os.listdir(test_dir) if f.endswith(".goose"))
+    # The examples are in examples/.
     ex_dir = os.path.join(ROOT, "examples")
     examples = sorted(f for f in os.listdir(ex_dir) if f.endswith(".goose")) if os.path.isdir(ex_dir) else []
     if args.k:
@@ -94,7 +96,10 @@ def main():
                 check(f"{t} native", rc, out, err, expected)
 
     for e in examples:
-        rc, out, err = run([goose, e, "--", *EXAMPLE_ARGS.get(e[:-6], [])], os.path.join(ROOT, "examples"))
+        # None: the example needs a live peer, so it is only type-checked.
+        ex_args = EXAMPLE_ARGS.get(e[:-6], [])
+        cmd = [goose, "check", e] if ex_args is None else [goose, e, "--", *ex_args]
+        rc, out, err = run(cmd, ex_dir)
         check(f"examples/{e}", rc, out, err, None)
 
     print(f"\n{passed} passed, {len(failed)} failed")

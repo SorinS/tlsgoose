@@ -2,8 +2,8 @@
 
 TLS 1.3 (RFC 8446) and TLS 1.2 (RFC 5246) for the Goose language: client
 and server connections, the key schedules and the record layer. It builds on
-[bignum](../bigmongoose.git) for the cryptography,
-[x509](../x509goose.git) for certificates and [asn1](../asn1goose.git)
+[bignum](https://github.com/SorinS/bigmongoose) for the cryptography,
+[x509](https://github.com/SorinS/x509goose) for certificates and [asn1](https://github.com/SorinS/asn1goose)
 for keys. Nothing here does I/O: a connection is fed the bytes that
 arrive, and hands back the bytes to send and the application data
 received. The caller owns the socket, or the pipe, or the test harness.
@@ -39,8 +39,10 @@ reset, which can reach the peer before it has read the alert
   AES-CBC with HMAC.
 
 ```goose
-import tls from "../tlsgoose.git";
-import bignum from "../bigmongoose.git";      // tls needs it; the root declares it
+import tls from "SorinS/tlsgoose@v0.7.0";
+import bignum from "SorinS/bigmongoose@v0.7.0";   // tls needs it; the root declares it
+import asn1 from "SorinS/asn1goose@v0.7.0";
+import x509 from "SorinS/x509goose@v0.7.0";
 import tls.schedule;
 import tls.record;
 
@@ -83,17 +85,17 @@ tls::close(c, out);
 A server is the same, built from
 `tls::server_config(chain_der, key_der) -> ServerConfig, bool`, with
 `tls::server(cfg)` and `tls::server_feed`. The key may be PKCS #8 (RSA,
-EC, Ed25519, ML-DSA), SEC 1 or PKCS #1 DER.
+EC, Ed25519, Ed448, ML-DSA), SEC 1 or PKCS #1 DER.
 
 | | Client | Server |
 |---|---|---|
 | Suites | all three, in `cfg.suites` order | its own order of preference |
-| Key exchange | The post-quantum X25519MLKEM768 (the default), SecP256r1MLKEM768 and SecP384r1MLKEM1024 hybrids and MLKEM1024 alone; X25519, P-256, P-384, P-521. The defaults are Go's: everything but MLKEM1024. The client sends a share for the first of `cfg.groups` (plus, beside a hybrid, a share of its ECDH part on the same key, as Go does) and reaches the others through HelloRetryRequest | its first group the client has a share for, else a HelloRetryRequest for its first group the client supports |
-| Certificates | checked by `x509::verify_with_roots`: chain to `cfg.roots`, or to the system's roots when `cfg.system_roots`, name `cfg.server_name`, time `cfg.now` (0 for now); `cfg.verify = false` skips it. Whatever `verify`, a leaf with keyUsage must allow what TLS does with it (digitalSignature to sign, in TLS 1.3 and 1.2 alike and RSA keys included, as RFC 5246 §7.4.2 requires and stricter than OpenSSL; keyEncipherment for RSA key exchange). RSA keys are taken from 1024 to 8192 bits, Go's limits (rsa1024min, and crypto/tls's defaultMaxRSAKeySize for peers) | sends `cfg.chain`, signs CertificateVerify with RSA-PSS, ECDSA (P-256, P-384, P-521), Ed25519 or ML-DSA as its key and the client allow |
-| CertificateVerify | ML-DSA-44/65/87 (draft-ietf-tls-mldsa, offered first, as Go does), RSA-PSS, RSA PKCS #1 v1.5, ECDSA P-256/P-384/P-521, Ed25519 | |
+| Key exchange | The post-quantum X25519MLKEM768 (the default), SecP256r1MLKEM768 and SecP384r1MLKEM1024 hybrids and MLKEM1024 alone; X25519, P-256, P-384, P-521; X448 and brainpoolP256r1tls13, P384r1tls13 and P512r1tls13 (RFC 8734). The defaults are Go's, everything but MLKEM1024, then X448 and the three Brainpool groups last. The client sends a share for the first of `cfg.groups` that TLS 1.3 takes (plus, beside a hybrid, a share of its ECDH part on the same key, as Go does) and reaches the others through HelloRetryRequest; so the new groups cost a ClientHello 8 bytes and no share (their schemes, offered by default, 8 more), and a server that wants one asks for it | its first group the client has a share for, else a HelloRetryRequest for its first group the client supports; never TLS 1.2's Brainpool code points (26-28) |
+| Certificates | checked by `x509::verify_with_roots`: chain to `cfg.roots`, or to the system's roots when `cfg.system_roots`, name `cfg.server_name`, time `cfg.now` (0 for now); `cfg.verify = false` skips it. Verifying with no `cfg.server_name` is refused, as in Go: `client_start` fails with internal_error and sends nothing. Whatever `verify`, a leaf with keyUsage must allow what TLS does with it (digitalSignature to sign, in TLS 1.3 and 1.2 alike and RSA keys included, as RFC 5246 §7.4.2 requires and stricter than OpenSSL; keyEncipherment for RSA key exchange). RSA keys are taken from 1024 to 8192 bits, Go's limits (rsa1024min, and crypto/tls's defaultMaxRSAKeySize for peers) | sends `cfg.chain`, signs CertificateVerify with RSA-PSS, ECDSA (P-256, P-384, P-521, and the Brainpool curves with RFC 8734's schemes), Ed25519, Ed448 or ML-DSA as its key and the client allow. One certificate: there is no choosing among several by the client's signature_algorithms |
+| CertificateVerify | ML-DSA-44/65/87 (draft-ietf-tls-mldsa, offered first, as Go does), RSA-PSS, RSA PKCS #1 v1.5, ECDSA P-256/P-384/P-521, ecdsa_brainpoolP256r1tls13_sha256, P384r1tls13_sha384, P512r1tls13_sha512 (0x081a-0x081c, each bound to its curve), Ed25519, Ed448 (0x0808) | |
 | Client certificates | sends `cfg.cert_chain` (set with `tls::set_client_certificate(cfg, chain_der, key_der)`) when asked, if its key signs with a scheme the server takes and, if the server names CAs, one of its certificates was issued by one of them; otherwise an empty Certificate | asks per `cfg.client_auth`, Go's modes: `NO_CLIENT_CERT` (the default), `REQUEST_CLIENT_CERT`, `REQUIRE_ANY_CLIENT_CERT`, `VERIFY_CLIENT_CERT_IF_GIVEN`, `REQUIRE_AND_VERIFY_CLIENT_CERT`; names the CAs of `cfg.client_cas` and checks chains against them (the system's roots when empty, as Go) for client authentication; `tls::peer_certificates(c)`, `tls::peer_verified(c)` |
 | ALPN | `cfg.alpn` offered | its first protocol the client offered, or `no_application_protocol` |
-| Resumption | offers `cfg.session` when it is unexpired, for `cfg.server_name`, and one of `cfg.suites` has its hash (also after a HelloRetryRequest); `tls::session(c)` is the latest ticket's session | takes a ticket sealed under `cfg.ticket_key` that is unexpired and of the suite's hash, checking its binder; sends `cfg.tickets` tickets (1, as Go) to clients that allow psk_dhe_ke |
+| Resumption | offers `cfg.session` when it is unexpired, for `cfg.server_name`, and one of `cfg.suites` has its hash (also after a HelloRetryRequest); `tls::session(c)` is the latest ticket's session | takes a ticket sealed under `cfg.ticket_key` that is unexpired, of the suite's hash and made for the SNI the client sends now (else a full handshake), checking its binder; sends `cfg.tickets` tickets (1, as Go) to clients that allow psk_dhe_ke |
 | After the handshake | NewSessionTicket kept as the session; KeyUpdate both ways (`key_update(c, request, out)`) | KeyUpdate; `send_session_ticket(c, cfg, out)` for another ticket |
 
 Both sides use middlebox compatibility mode (a session ID and
@@ -103,6 +105,20 @@ fatal alert RFC 8446 calls for and stop. `c.alert` holds the alert sent or
 received, and `c.error` the x509 error behind a certificate alert. Every
 random value comes from an HMAC-DRBG seeded from the OS. A config's
 `seed` fixes it, for tests.
+
+Strict where RFC 8446 says so: a key_share naming a group twice
+(illegal_parameter), an SNI host name longer than 255 bytes (decode_error,
+not cut), a change_cipher_spec before the ClientHello (unexpected_message),
+a CertificateRequest in the handshake with a context (illegal_parameter)
+or a signature_algorithms list that is empty or of odd length
+(decode_error). A HelloRetryRequest with a cookie and no key_share (from a
+server that keeps no state, such as OpenSSL's `-stateless`) is answered
+with the same shares; one asking for nothing new is illegal_parameter.
+
+Once a connection fails, or `close` has sent close_notify on a closed one,
+its secrets are zeroed (the key schedule, record keys, private keys,
+TLS 1.2's master secret, the DRBG); the session from `tls::session(c)`
+stays. A close_notify received zeroes the read keys.
 
 Not supported: 0-RTT, external PSKs, post-handshake client
 authentication, and TLS 1.1 or older.
@@ -238,7 +254,9 @@ and `cfg.max_version` (`tls::VERSION_TLS12`, `tls::VERSION_TLS13`) narrow
 that, and `tls::version(c)` says what was negotiated. The client offers
 both in one ClientHello. Offering only TLS 1.2, it leaves out TLS 1.3's
 extensions, its ML-KEM groups and its ML-DSA schemes, as Go does, since
-some servers refuse a TLS 1.2 hello that has them. The server takes TLS
+some servers refuse a TLS 1.2 hello that has them, and the Brainpool
+groups' and schemes' TLS 1.3 code points; offering only TLS 1.3, it
+leaves out the Brainpool groups' TLS 1.2 ones. The server takes TLS
 1.3 when the client offers it. A TLS 1.3 server that settles on TLS 1.2
 ends its random in RFC 8446's downgrade sentinel, which a client that
 offered TLS 1.3 refuses. It also refuses `TLS_FALLBACK_SCSV` from a client
@@ -246,12 +264,12 @@ that could do better.
 
 | | Client | Server |
 |---|---|---|
-| Suites | `cfg.suites12`, Go's defaults: ECDHE-ECDSA and ECDHE-RSA with AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305, AES-128-CBC-SHA and AES-256-CBC-SHA | its own order, for its key (ECDSA suites for EC and Ed25519 keys, RSA ones for RSA); the CBC-SHA256 suites and RSA key exchange (`TLS_RSA_WITH_*`) only when added, as in Go |
-| Key exchange | X25519, P-256, P-384, P-521; the ServerKeyExchange signature checked against the certificate | its first ECDH group the client takes; RSA key exchange decrypts in constant time and goes on with a random premaster secret when the ciphertext is bad |
-| Signatures | RSA-PSS, RSA PKCS #1 v1.5, ECDSA (any of its hashes on any curve, as TLS 1.2 allows), Ed25519; no SHA-1, as Go since 1.25 | the client's first scheme its key signs with |
+| Suites | `cfg.suites12`, Go's defaults: ECDHE-ECDSA and ECDHE-RSA with AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305, AES-128-CBC-SHA and AES-256-CBC-SHA | its own order, for its key (ECDSA suites for EC, Brainpool included, Ed25519 and Ed448 keys, RSA ones for RSA); the CBC-SHA256 suites and RSA key exchange (`TLS_RSA_WITH_*`) only when added, as in Go |
+| Key exchange | X25519, P-256, P-384, P-521, X448; brainpoolP256r1, P384r1 and P512r1 (RFC 7027: 26-28) when added to `cfg.groups`, never their TLS 1.3 code points; the ServerKeyExchange signature checked against the certificate | its first ECDH group the client takes; RSA key exchange decrypts in constant time and goes on with a random premaster secret when the ciphertext is bad |
+| Signatures | RSA-PSS, RSA PKCS #1 v1.5, ECDSA (any of its hashes on any curve, as TLS 1.2 allows: a Brainpool key signs with ecdsa_secp256r1_sha256 and the others, which name only the hash here, RFC 8422), Ed25519, Ed448; no SHA-1, as Go since 1.25 | the client's first scheme its key signs with |
 | Master secret | extended (RFC 7627) when both take it; a session keeps what it had | the same |
 | Resumption | session tickets (RFC 5077): `tls::session(c)` is a TLS 1.2 session after a TLS 1.2 handshake, offered again in session_ticket | stateless tickets under `cfg.ticket_key`, a new one on each resumption |
-| Client certificates | sent when the server asks for its key's type and scheme and, if it names CAs, one of them issued it; not Ed25519 ones (below) | Go's five modes, as in TLS 1.3; CertificateRequest offers every scheme above but Ed25519 |
+| Client certificates | sent when the server asks for its key's type and scheme and, if it names CAs, one of them issued it; not Ed25519 or Ed448 ones (below) | Go's five modes, as in TLS 1.3; CertificateRequest offers every scheme above but Ed25519 and Ed448 |
 | Renegotiation | refused: secure renegotiation's extension is sent, and a HelloRequest gets a `no_renegotiation` warning | a ClientHello after the handshake gets the same warning |
 
 TLS 1.2's CertificateVerify signs all the handshake messages before it,
@@ -266,9 +284,10 @@ Goose struct holds its buffers in full). So a TLS 1.2 client certificate
 cannot be Ed25519 here, which Go allows: the server does not offer the
 scheme and refuses it with illegal_parameter, and a client with an Ed25519
 key sends no certificate, as Go's does for a key no offered scheme suits.
-TLS 1.3 signs a transcript hash and takes Ed25519 client certificates;
-Ed25519 server certificates work in TLS 1.2, as ServerKeyExchange signs
-only the randoms and the key exchange parameters.
+Ed448 likewise. TLS 1.3 signs a transcript hash and takes Ed25519 and
+Ed448 client certificates; Ed25519 and Ed448 server certificates work in
+TLS 1.2, as ServerKeyExchange signs only the randoms and the key exchange
+parameters.
 
 The records are TLS 1.2's: AES-GCM with an explicit nonce (the sequence
 number, as Go and OpenSSL send it), ChaCha20-Poly1305 (RFC 7905), and
@@ -320,7 +339,9 @@ versions Go 1.27 and OpenSSL 3.6 interoperate with.
 | RFC 8446 | TLS 1.3: handshake, HelloRetryRequest, key schedule, record protection, KeyUpdate, PSK resumption (psk_dhe_ke), middlebox compatibility mode, signature schemes, the downgrade sentinel (§4.1.3) | `tls.handshake`, `tls.schedule`, `tls.record`, `tls.session` |
 | RFC 8448 | TLS 1.3 example handshake traces, reproduced byte for byte | `test/rfc8448.goose` |
 | RFC 5246 | TLS 1.2: handshake, PRF, key block, Finished, record protection | `tls.handshake12`, `tls.schedule`, `tls.record` |
-| RFC 8422 (obsoletes RFC 4492) | ECDHE and ECDSA/EdDSA for TLS 1.2: ServerKeyExchange, named groups, point formats, Ed25519 certificates | `tls.handshake12` |
+| RFC 8422 (obsoletes RFC 4492) | ECDHE and ECDSA/EdDSA for TLS 1.2: ServerKeyExchange, named groups (X448 too), point formats, Ed25519 and Ed448 certificates | `tls.handshake12` |
+| RFC 7027 | The Brainpool curves for TLS 1.2: brainpoolP256r1, P384r1, P512r1 (26-28), signing with the ECDSA schemes | `tls.handshake12` |
+| RFC 8734 | The Brainpool curves for TLS 1.3: brainpoolP256r1tls13, P384r1tls13, P512r1tls13 (0x001f-0x0021) and ecdsa_brainpoolP*r1tls13_sha* (0x081a-0x081c) | `tls.handshake` |
 | RFC 5288, RFC 5289 | AES-GCM suites for TLS 1.2 (explicit nonce), and the ECDHE GCM and CBC-SHA256 suites | `tls`, `tls.record` |
 | RFC 7905 | ChaCha20-Poly1305 suites for TLS 1.2 | `tls`, `tls.record` |
 | RFC 7627 | Extended master secret, and its rules for resumption (§5.3) | `tls.schedule`, `tls.handshake12` |
@@ -337,8 +358,8 @@ versions Go 1.27 and OpenSSL 3.6 interoperate with.
 | draft-ietf-tls-mldsa | ML-DSA-44/65/87 signature schemes (TLS 1.3 only) | `tls.handshake` |
 
 Under these, the other packages supply the primitives and certificates:
-X25519 (RFC 7748), Ed25519 (RFC 8032), ECDSA on P-256, P-384 and P-521
-(FIPS 186-5), RSA PKCS #1 v1.5 and PSS (RFC 8017), HKDF (RFC 5869), HMAC
+X25519 and X448 (RFC 7748), Ed25519 and Ed448 (RFC 8032), ECDSA on P-256,
+P-384 and P-521 (FIPS 186-5) and the Brainpool curves (RFC 5639), RSA PKCS #1 v1.5 and PSS (RFC 8017), HKDF (RFC 5869), HMAC
 (RFC 2104), AES-GCM (SP 800-38D), ChaCha20-Poly1305 (RFC 8439), ML-KEM
 (FIPS 203) and ML-DSA (FIPS 204) in bignum, and X.509 path validation
 (RFC 5280) in x509.
@@ -349,6 +370,22 @@ post-handshake client authentication, GREASE (RFC 8701), encrypt-then-MAC
 8879), record size limit (RFC 8449), OCSP stapling and SCTs, TLS 1.1 and
 older, and renegotiation.
 
+## Examples
+
+In `examples/`, run from the repository's top as `goose examples/<name>.goose`
+(or from that folder); each checks its own results.
+
+- `handshake.goose`: a TLS 1.3 client and server in one process, with certificates made by x509: data, a key update, close_notify.
+- `tls12.goose`: version negotiation: TLS 1.3 by default, TLS 1.2 when either side stops there, and its suites.
+- `client_cert.goose`: mutual TLS: the server requires and checks a client certificate.
+- `resumption.goose`: session tickets: a session saved as bytes and resumed on a second connection.
+- `alpn_sni.goose`: ALPN and the server name, and what is refused when they do not match.
+- `post_quantum.goose`: X25519MLKEM768, MLKEM1024 and a HelloRetryRequest, with ML-DSA certificates.
+- `new_curves.goose`: X448 and brainpoolP512r1tls13 (by a HelloRetryRequest), an Ed448 server certificate and a Brainpool client certificate from a Brainpool CA, in TLS 1.3 and 1.2.
+- `ech.goose`: Encrypted Client Hello, and retry configs after a stale one.
+- `records.goose`: the key schedule and the record layer on their own.
+- `https_get.goose`: a TLS client over a socket, checked against the system's roots: `HOST [PORT [PATH]]`. Needs a live server; `run_tests.py` only type-checks it.
+
 ## Tests
 
 ```bash
@@ -357,6 +394,7 @@ python3 scripts/run_tests.py --native   # also built with the C compiler
 python3 scripts/live_interop.py         # live, against OpenSSL (below)
 python3 scripts/go_interop.py           # live, against Go's crypto/tls (below)
 python3 scripts/gen_handshake.py        # remake vectors/hs_certs.txt
+python3 scripts/gen_handshake.py --add  # add the key types it lacks, under its CAs
 python3 scripts/openssl_interop.py      # recapture vectors of OpenSSL's connections
 python3 scripts/rfc8448.py              # re-extract RFC 8448's trace (fetches the RFC)
 tools/gointerop.sh <mode> -flags ...    # Go's side by hand (gointerop.sh <mode> -h lists the flags)
@@ -472,7 +510,25 @@ library only).
     client certificate: stricter than OpenSSL, as RFC 5246 asks), and
     keyEncipherment for RSA key exchange.
 
-`scripts/live_interop.py` runs live connections against OpenSSL (179
+- `curves`: X448, the Brainpool curves and Ed448:
+  - X448 and brainpoolP256r1tls13, P384r1tls13 and P512r1tls13 alone on
+    both sides and by a HelloRetryRequest; X448 and brainpoolP256r1,
+    P384r1 and P512r1 in TLS 1.2;
+  - the defaults: no share for them, named last, the TLS 1.2 Brainpool
+    code points left out, a server taking them from a client that has only
+    them;
+  - each version's code points kept to it: TLS 1.3 refuses 26-28, TLS 1.2
+    skips 0x001f-0x0021, and each hello names only its own;
+  - Ed448 and Brainpool server certificates in TLS 1.3 and with the ECDSA
+    suites of TLS 1.2 (not ECDHE-RSA);
+  - the schemes: each Brainpool one bound to its curve, the NIST ones not
+    for a Brainpool key in TLS 1.3 but the ECDSA codes for it in TLS 1.2,
+    Ed448's; a hello without them refused by a server whose key needs
+    them;
+  - Ed448 and Brainpool client certificates, checked, in TLS 1.3, the
+    Brainpool one in TLS 1.2 too and the Ed448 one not.
+
+`scripts/live_interop.py` runs live connections against OpenSSL (215
 cases). It builds `tools/peer.goose`, a peer driven over stdin and stdout,
 and relays its bytes to Python's ssl module through memory BIOs. It
 covers:
@@ -501,7 +557,17 @@ covers:
   and P-521 certificates, ECDHE-RSA and RSA key exchange, with GCM,
   ChaCha20-Poly1305 and CBC), each group; version negotiation against an
   OpenSSL that stops at either version; resumption with tickets, also
-  without the extended master secret; client certificates; ALPN.
+  without the extended master secret; client certificates; ALPN;
+- X448, the Brainpool curves and Ed448: Ed448 and brainpoolP256r1, P384r1
+  and P512r1 certificates both ways (ed448 and RFC 8734's schemes), X448
+  and each Brainpool TLS 1.3 group alone both ways, HelloRetryRequests to
+  them both ways (the client's defaults name them), Ed448 and Brainpool
+  client certificates both ways; in TLS 1.2, Ed448 certificates, X448, an
+  OpenSSL client's Brainpool certificate, and no Ed448 client
+  certificates. OpenSSL 4.1 has no TLS 1.2 Brainpool groups, and so in
+  TLS 1.2 neither serves nor takes a Brainpool server certificate, nor
+  takes a Brainpool client certificate (between two OpenSSLs too): those
+  cases are pinned as refused.
 
 `scripts/go_interop.py` runs this package against Go's crypto/tls
 (`tools/gointerop`, standard library only; `tools/gointerop.sh` runs it
