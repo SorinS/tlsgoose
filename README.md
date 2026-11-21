@@ -39,10 +39,11 @@ reset, which can reach the peer before it has read the alert
   AES-CBC with HMAC.
 
 ```goose
-import tls from "SorinS/tlsgoose@v0.7.0";
-import bignum from "SorinS/bigmongoose@v0.7.0";   // tls needs it; the root declares it
-import asn1 from "SorinS/asn1goose@v0.7.0";
-import x509 from "SorinS/x509goose@v0.7.0";
+import tls from "SorinS/tlsgoose@v0.9.1";
+import entropy from "SorinS/entropygoose@v0.9.1";   // tls needs it; the root declares it
+import bignum from "SorinS/bigmongoose@v0.9.1";
+import asn1 from "SorinS/asn1goose@v0.9.1";
+import x509 from "SorinS/x509goose@v0.9.1";
 import tls.schedule;
 import tls.record;
 
@@ -152,6 +153,26 @@ with whether it was checked. As in Go, a ticket is not taken when:
 - the certificate has expired;
 - certificates are checked now and this one was not.
 
+### Keys held elsewhere
+
+A server or client whose private key is in a TPM, on a PKCS#11 token or
+in a remote service gives its configuration the certificate chain alone:
+`server_config(chain)` and `set_client_certificate(cfg, chain)` take the
+leaf's public key as an `x509::external_key`. The handshake's signatures
+(CertificateVerify, TLS 1.2's ServerKeyExchange and client
+CertificateVerify) are asked of a signer passed last to `feed`,
+`client_feed` or `server_feed`, as x509's README describes signers:
+
+    tls::server_feed(c, cfg, input, out, app) { k, alg, h, data => tpm2::sign_data(t, key, s, alg, h, data) }
+
+A signer that returns nothing ends the handshake with internal_error, as
+Go's does. The TLS 1.2 RSA key exchange, which decrypts with the key, is
+never chosen for a key held elsewhere. TLS 1.3's RSA-PSS needs a salt as
+long as the hash, which some TPMs do not use (swtpm does).
+test/signer.goose covers every key type in TLS 1.3, P-256 and RSA in TLS
+1.2, client certificates in both, a failing signer and none; example:
+`examples/key_elsewhere.goose`.
+
 ### Resumption
 
 Resumption works as in Go's crypto/tls, with PSK and (EC)DHE
@@ -234,7 +255,10 @@ public name:
 - a certificate request is answered with none.
 
 It then fails with `ech_required`, and `tls::ech_retry_configs(c)` holds
-the server's retry configs to try again with.
+the server's retry configs to try again with. Only then: a handshake that
+failed any other way (a certificate refused, say), or one whose
+certificate was not verified, gives none, since whoever sent them was not
+authenticated, and a retry with them would seal the real name to them.
 
 The server tries each of its keys on an outer ClientHello. With the first
 that opens it, it rebuilds the inner one and goes on with that one: the
@@ -270,7 +294,7 @@ that could do better.
 | Master secret | extended (RFC 7627) when both take it; a session keeps what it had | the same |
 | Resumption | session tickets (RFC 5077): `tls::session(c)` is a TLS 1.2 session after a TLS 1.2 handshake, offered again in session_ticket | stateless tickets under `cfg.ticket_key`, a new one on each resumption |
 | Client certificates | sent when the server asks for its key's type and scheme and, if it names CAs, one of them issued it; not Ed25519 or Ed448 ones (below) | Go's five modes, as in TLS 1.3; CertificateRequest offers every scheme above but Ed25519 and Ed448 |
-| Renegotiation | refused: secure renegotiation's extension is sent, and a HelloRequest gets a `no_renegotiation` warning | a ClientHello after the handshake gets the same warning |
+| Renegotiation | refused: secure renegotiation's extension is sent, and a HelloRequest gets a `no_renegotiation` warning; a second one ends the connection | a ClientHello after the handshake gets the same warning, and a second one ends it |
 
 TLS 1.2's CertificateVerify signs all the handshake messages before it,
 with the hash of a scheme that is settled only when CertificateRequest
@@ -300,6 +324,26 @@ time. `scripts/cbc_timing.py` measures it. TLS 1.2's warning
 alerts are dropped, as Go drops them, and KeyUpdate is TLS 1.3's alone. ECH
 is TLS 1.3's too: a client that offers it offers nothing older.
 
+### QUIC
+
+A connection made with `quic_client(cfg, params)` or `quic_server(cfg,
+params)` runs the TLS 1.3 handshake for QUIC (RFC 9001 §4): its
+messages go out as chunks tagged with their encryption level
+(`QUIC_INITIAL`, `QUIC_HANDSHAKE`, `QUIC_APPLICATION`; `quic_next_chunk`
+reads them) rather than records, the client's first flight from
+`quic_start`, and `feed_crypto(c, cfg, level, data, out)` takes what
+arrives in CRYPTO frames, refusing data at a level other than the one
+read now. `params` is this side's transport parameters, sent in the
+quic_transport_parameters extension (ClientHello, EncryptedExtensions);
+`quic_peer_params` gives the peer's, whose absence is missing_extension.
+ALPN is required (no_application_protocol otherwise), TLS 1.2 and the
+compatibility mode's session ID and change_cipher_spec are not used, a
+KeyUpdate message is refused (QUIC updates its own keys), and an alert
+is not sent but left in `c.alert` for QUIC's CRYPTO_ERROR.
+`quic_secret(c, level, write)` gives the traffic secrets QUIC derives its
+packet keys from, `quic_read_level` and `quic_write_level` where the
+handshake is. gslib's `quic` is built on it.
+
 ## The key schedule
 
 `schedule(hash, psk)` starts from the early secret.
@@ -310,7 +354,10 @@ master secret. Each takes the transcript hash at its point in the
 handshake. `traffic_key` and `traffic_iv` turn a traffic secret into AEAD
 keys. `finished_data` and `finished_ok` (constant time) handle Finished,
 `next_traffic_secret` handles KeyUpdate, and `export_keying_material` is
-the exporter. `hkdf_expand_label` and `derive_secret` are public for
+the exporter; a connection's own, either version, is
+`tls::export_keys(c, label, context, has_context, len)`, the same bytes
+on both ends once the handshake is done (what EAP-TLS, PEAP and TTLS
+take their keys from: gslib's `radius`). `hkdf_expand_label` and `derive_secret` are public for
 anything else. For TLS 1.2: `prf12`, `master_secret12` (extended or not),
 `key_block12`, `finished12` and `export12` (RFC 5705).
 
@@ -348,7 +395,7 @@ versions Go 1.27 and OpenSSL 3.6 interoperate with.
 | RFC 5077 | Session tickets for TLS 1.2, stateless on the server | `tls.handshake12`, `tls.session` |
 | RFC 5746 | Secure renegotiation: renegotiation_info and its SCSV (renegotiation itself is refused) | `tls.handshake12` |
 | RFC 7507 | TLS_FALLBACK_SCSV | `tls.handshake12` |
-| RFC 5705 | Keying material exporter for TLS 1.2 (`export12`; TLS 1.3's is RFC 8446 §7.5) | `tls.schedule` |
+| RFC 5705 | Keying material exporter for TLS 1.2 (`export12`; TLS 1.3's is RFC 8446 §7.5; a connection's, `export_keys`) | `tls.schedule`, `tls.handshake` |
 | RFC 6066 §3 | Server Name Indication | `tls.handshake` |
 | RFC 7301 | ALPN | `tls.handshake` |
 | RFC 9849 | Encrypted Client Hello, client and server, with HelloRetryRequest and retry configs | `tls.ech`, `tls.handshake` |
@@ -384,6 +431,7 @@ In `examples/`, run from the repository's top as `goose examples/<name>.goose`
 - `new_curves.goose`: X448 and brainpoolP512r1tls13 (by a HelloRetryRequest), an Ed448 server certificate and a Brainpool client certificate from a Brainpool CA, in TLS 1.3 and 1.2.
 - `ech.goose`: Encrypted Client Hello, and retry configs after a stale one.
 - `records.goose`: the key schedule and the record layer on their own.
+- `key_elsewhere.goose`: a server whose configuration holds only its certificate, its handshake signed by a signer passed to feed, as a TPM's or a token's would be.
 - `https_get.goose`: a TLS client over a socket, checked against the system's roots: `HOST [PORT [PATH]]`. Needs a live server; `run_tests.py` only type-checks it.
 
 ## Tests
@@ -418,6 +466,12 @@ x509goose.git beside this repository. The live scripts run everything on
 127.0.0.1 and leave nothing running; go_interop.py needs Go (standard
 library only).
 
+- `quic`: the QUIC mode: a client and a server through CRYPTO data
+  only, at the right levels, both reaching the same handshake and
+  application secrets, the transport parameters exchanged, ALPN
+  agreed; after a HelloRetryRequest and with resumption (the ticket at
+  the 1-RTT level); refused: no common protocol, no transport
+  parameters, data at the wrong level, a KeyUpdate: 28 checks.
 - `rfc8448`: the simple 1-RTT handshake of RFC 8448 §3, end to end. It
   starts from the two X25519 key pairs, runs every secret, key and
   Finished message, and reproduces every record of the trace byte for
@@ -472,7 +526,8 @@ library only).
 
   Not accepted:
   - a server without keys, with another key (whose retry configs then
-    work), or without retry configs;
+    work), or without retry configs; none given out when the server's
+    certificate was refused;
   - a changed payload;
   - a certificate request answered with none;
   - a public name the certificate does not cover.
@@ -500,7 +555,7 @@ library only).
     messages themselves (PKCS #1 v1.5 and ECDSA are deterministic), and
     none for other messages; Ed25519 refused;
   - a wrong name, an unknown root; renegotiation refused both ways while
-    data keeps flowing; a changed record under GCM, ChaCha20-Poly1305 and
+    data keeps flowing, and a second request ending the connection; a changed record under GCM, ChaCha20-Poly1305 and
     CBC;
   - sessions: one got without verifying is not offered when verifying,
     nor one whose roots were replaced; a client certificate's ticket is

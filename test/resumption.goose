@@ -12,9 +12,10 @@
 // session that was verified and whose chain its roots still accept.
 import std;
 import tls from "..";
-import bignum from "SorinS/bigmongoose@v0.7.0";
-import asn1 from "SorinS/asn1goose@v0.7.0";
-import x509 from "SorinS/x509goose@v0.7.0";
+import entropy from "SorinS/entropygoose@v0.9.1";
+import bignum from "SorinS/bigmongoose@v0.9.1";
+import asn1 from "SorinS/asn1goose@v0.9.1";
+import x509 from "SorinS/x509goose@v0.9.1";
 import tls.handshake;
 import tls.session;
 
@@ -239,6 +240,25 @@ fn main() {
     var out9: u8[>..] = [];
     tls::client_start(c9, late, out9);
     check("expired session not offered", !c9.psk_offered);
+    // Resumed on day 6, the new ticket keeps the first handshake's time:
+    // offered on day 8 (the client got it two days before), the server
+    // does not take it.
+    var d6 = client_cfg();
+    d6.session = sess;
+    d6.now = NOW + 6 * 86400;
+    var sc_d6 = server_cfg("p256");
+    sc_d6.ticket_key = sc.ticket_key;
+    sc_d6.now = d6.now;
+    let ok10, r10, s10 = connect("day 6", d6, sc_d6);
+    check("resumed on day 6", ok10 && r10);
+    var d8 = client_cfg();
+    d8.session = s10;
+    d8.now = NOW + 8 * 86400;
+    var sc_d8 = server_cfg("p256");
+    sc_d8.ticket_key = sc.ticket_key;
+    sc_d8.now = d8.now;
+    let ok11, r11, s11 = connect("its ticket on day 8", d8, sc_d8);
+    check("its ticket, day 8: full handshake", ok11 && !r11);
     var other_name = client_cfg();
     other_name.session = sess;
     other_name.server_name.clear();

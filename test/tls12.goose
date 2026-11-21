@@ -12,9 +12,10 @@
 // - keyUsage against what the key does, in TLS 1.3 and 1.2.
 import std;
 import tls from "..";
-import bignum from "SorinS/bigmongoose@v0.7.0";
-import asn1 from "SorinS/asn1goose@v0.7.0";
-import x509 from "SorinS/x509goose@v0.7.0";
+import entropy from "SorinS/entropygoose@v0.9.1";
+import bignum from "SorinS/bigmongoose@v0.9.1";
+import asn1 from "SorinS/asn1goose@v0.9.1";
+import x509 from "SorinS/x509goose@v0.9.1";
 import tls.handshake;
 import tls.session;
 import tls.record;
@@ -303,6 +304,17 @@ fn resumption() {
         sc_late.now = NOW + 8 * 86400;
         let o8 = connect(cc_late, sc_late);
         check("expired, full", o8.ok && !o8.resumed);
+        // Resumed on day 6, the new ticket keeps the first handshake's
+        // time: on day 8 it no longer resumes.
+        var cc_d6 = copy(cc);
+        cc_d6.now = NOW + 6 * 86400;
+        var sc_d6 = copy(sc);
+        sc_d6.now = NOW + 6 * 86400;
+        let o9 = connect(cc_d6, sc_d6);
+        check("resumed on day 6", o9.ok && o9.resumed && o9.has_session);
+        cc_late.session = o9.session;
+        let o10 = connect(cc_late, sc_late);
+        check("its ticket, day 8: full", o10.ok && !o10.resumed);
     }
     // A session got without verifying resumes only without verifying; one
     // verified stops resuming when the roots no longer take its chain.
@@ -592,6 +604,43 @@ fn records() {
     }
 }
 
+// A second renegotiation ends the connection: a record full of 4-byte
+// ClientHellos (or HelloRequests) would otherwise be answered with one
+// sealed alert each, without end.
+fn renegotiation_flood() {
+    let sc = server_cfg("p256");
+    let cc = client12();
+    var c = tls::client(cc);
+    var s = tls::server(sc);
+    var to_server: u8[>..] = [];
+    var capp: u8[>..] = [];
+    var sapp: u8[>..] = [];
+    tls::client_start(c, cc, to_server);
+    pump(c, cc, s, sc, to_server, capp, sapp);
+    check("connected", tls::connected(c) && tls::connected(s));
+    var hellos: u8[>..] = [];
+    for i in 1000 { hellos.append([1, 0, 0, 0]); }
+    let flood = tls::seal_record(c.write, tls::CT_HANDSHAKE, hellos);
+    var reply: u8[>..] = [];
+    let r1 = tls::server_feed(s, sc, flood, reply, sapp);
+    check("a server: renegotiation asked twice", tls::failed(s) && s.alert == tls::ALERT_UNEXPECTED_MESSAGE &&
+          reply.len < 200);
+    // The other way, on a new connection.
+    var c2 = tls::client(cc);
+    var s2 = tls::server(sc);
+    to_server.clear();
+    tls::client_start(c2, cc, to_server);
+    pump(c2, cc, s2, sc, to_server, capp, sapp);
+    check("connected again", tls::connected(c2) && tls::connected(s2));
+    var requests: u8[>..] = [];
+    for i in 1000 { requests.append([0, 0, 0, 0]); }
+    let flood2 = tls::seal_record(s2.write, tls::CT_HANDSHAKE, requests);
+    var back: u8[>..] = [];
+    let r2 = tls::client_feed(c2, cc, flood2, back, capp);
+    check("a client: HelloRequest twice", tls::failed(c2) && c2.alert == tls::ALERT_UNEXPECTED_MESSAGE &&
+          back.len < 200);
+}
+
 // A leaf for example.com under root, on key, with that keyUsage.
 fn usage_leaf(root: const u8[:], root_key: const x509::PrivateKey&, key: const x509::PrivateKey&, usage: u32) -> u8[>..] {
     var t, ok = x509::template("CN=example.com", NOW - 3600, NOW + 86400);
@@ -699,6 +748,7 @@ fn main() {
     certificate_verify_schemes();
     alpn_and_failures();
     records();
+    renegotiation_flood();
     key_usage();
     print("tls12: ", checks, " checks, ", failures, " failed");
     if failures > 0 { exit(1); }

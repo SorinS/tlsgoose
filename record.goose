@@ -18,7 +18,7 @@ import bignum.aes;
 import bignum.modes;
 import bignum.hmac;
 import bignum.ct;
-import bignum.entropy;
+import entropy;
 
 // The largest plaintext fragment, and the most a protected record may
 // add to it (§5.1, §5.2).
@@ -81,7 +81,7 @@ fn seal_record12(k: RecordKeys&, ctype: u8, payload: const u8[:]) -> u8[>..] {
     if k.suite.aead == AEAD_AES_CBC {
         let mac = mac12(k, ctype, payload);
         var iv: u8[16] = [0; 16];
-        bignum::random_bytes(iv);
+        entropy::random_bytes(iv);
         var body: u8[>..] = [];
         body.append(payload);
         body.append(mac);

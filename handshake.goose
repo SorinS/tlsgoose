@@ -42,7 +42,7 @@ import bignum.ed25519;
 import bignum.rsa;
 import bignum.mlkem;
 import bignum.hmac;
-import bignum.entropy;
+import entropy;
 import asn1;
 import x509;
 import x509.verify;
@@ -89,6 +89,7 @@ let EXT_EARLY_DATA: u16 = 42;
 let EXT_PADDING: u16 = 21;
 let EXT_PSK_KEY_EXCHANGE_MODES: u16 = 45;
 let EXT_CERTIFICATE_AUTHORITIES: u16 = 47;
+let EXT_QUIC_TRANSPORT_PARAMETERS: u16 = 57;     // RFC 9001 §8.2
 // TLS 1.2's: point formats (RFC 8422), extended master secret (RFC 7627),
 // session tickets (RFC 5077), secure renegotiation (RFC 5746).
 let EXT_EC_POINT_FORMATS: u16 = 11;
@@ -223,6 +224,17 @@ fn client_config_pool(server_name: const u8[:], roots: const x509::CertPool&) ->
 // its key signs with and, if the server names the CAs it accepts, one of
 // its certificates was issued by one of them (as Go picks one); otherwise
 // the client sends none. False if the key does not parse.
+// The same for a key held elsewhere: the chain alone, the leaf's public key
+// standing for the key, and the handshake fed with a signer (feed).
+fn set_client_certificate(cfg: ClientConfig&, chain: const u8[:]) -> bool {
+    let k, ok = leaf_key(chain);
+    if !ok || chain.len > cfg.cert_chain.cap { return false; }
+    cfg.cert_key = k;
+    cfg.cert_chain.clear();
+    cfg.cert_chain.append(chain);
+    return true;
+}
+
 fn set_client_certificate(cfg: ClientConfig&, chain: const u8[:], key_der: const u8[:]) -> bool {
     let k, ok = x509::parse_private_key(key_der);
     if !ok || chain.len > cfg.cert_chain.cap { return false; }
@@ -297,11 +309,33 @@ fn server_config(chain: const u8[:], key_der: const u8[:]) -> ServerConfig, bool
         suites12: [], alpn: [], seed: 0, now: 0, tickets: 1, ticket_key: [0; 32], chain: [],
         client_auth: NO_CLIENT_CERT, ech_keys: [], client_cas: x509::new_pool(),
     };
-    bignum::random_bytes(s.ticket_key);
+    entropy::random_bytes(s.ticket_key);
     s.suites12.append(DEFAULT_SUITES12);
     if chain.len > s.chain.cap { return s, false; }
     s.chain.append(chain);
     return s, ok;
+}
+
+// The key held elsewhere whose certificate leads chain (concatenated DER):
+// x509::external_key of the leaf.
+fn leaf_key(chain: const u8[:]) -> x509::PrivateKey, bool {
+    let t, ok = asn1::read(chain, 0, chain.len);
+    if !ok { return x509::empty_key(), false; }
+    let leaf, e = x509::parse(chain[t.start..t.end]);
+    if e != x509::OK { return x509::empty_key(), false; }
+    let k, okk = x509::external_key(leaf);
+    return k, okk;
+}
+
+// A server whose key is held elsewhere (a TPM, a PKCS#11 token): the chain
+// alone, its leaf's public key standing for the key. Its handshakes are fed
+// with a signer (feed); the TLS 1.2 RSA key exchange, which decrypts with
+// the key, is never chosen.
+fn server_config(chain: const u8[:]) -> ServerConfig, bool {
+    var s, ok = server_config(chain, "");
+    let k, okk = leaf_key(chain);
+    s.key = k;
+    return s, okk && s.chain.len == chain.len;
 }
 
 // One connection, either side.
@@ -328,6 +362,8 @@ struct Conn {
     peer_verified: bool,              // the peer's certificate was checked against the roots
     peer_schemes: u16[..32], alpn: u8[..255], sni: u8[..255],
     tickets: i64, key_updates: i64,
+    renegotiations: i64,              // TLS 1.2 renegotiations refused, HelloRequests ignored
+    session_created: i64,             // a resumed session's first handshake, in s (0: not resumed)
     psk_offered: bool, resumed: bool,  // the client offered its session; the PSK was accepted
     psk_dhe: bool,                     // the client allows psk_dhe_ke, so takes tickets
     peer_not_after: i64,               // the server certificate's notAfter, for sessions (0: unchecked)
@@ -341,6 +377,7 @@ struct Conn {
     ech_offered: bool, ech_seen: bool, ech_confirm: bool, ech_accepted: bool, ech_backend: bool,
     ech_ctx: bignum::HpkeContext, ech_kdf: u16, ech_aead: u16, ech_config_id: u8, ech_max_name: i64,
     ech_public_name: u8[..255], ech_enc: u8[..2048], outer_random: u8[32], ech_retry: u8[..8192],
+    ech_retry_ok: bool,               // the public name's handshake succeeded: ech_retry is authenticated
     th_inner: Transcript,             // the client's inner transcript
     // TLS 1.2: the client offers TLS 1.2 and 1.3, and its TLS 1.2 session;
     // the master secret, extended or not; the peer's random; the peer
@@ -351,6 +388,12 @@ struct Conn {
     offer12: bool, offer13: bool, session12_offered: bool,
     master: u8[..48], ems: bool, peer_random: u8[32], secure_reneg: bool, ticket12: bool,
     peer_share: u8[..256], log: Log12,
+    // QUIC (RFC 9001 §4): handshake messages go out as CRYPTO data, each
+    // tagged with its encryption level, instead of records; the level
+    // read and written now; the transport parameters this side sends and
+    // the peer's.
+    quic: bool, rlevel: u8, wlevel: u8,
+    quic_local: u8[..1024], quic_peer: u8[..1024], has_quic_peer: bool,
     ch_inner: u8[..8192],             // the client's first ClientHelloInner, until the hash is known
     ch: u8[..8192],                   // the client's first ClientHello, until the hash is known
     inbuf: u8[..18437],               // one record in arrival
@@ -370,18 +413,19 @@ fn new_conn(is_server: bool, seed: u64) -> Conn {
         drbg_k: [0; 32], drbg_v: [1; 32], random: [0; 32], session_id: [],
         group: 0, group2: 0, x25519_sk: [0; 32], ec_sk: [], mlkem_seed: [0; 64], hrr: false, ccs_sent: false, cert_requested: false,
         ccs_seen: false, wiped: false, useless: 0, skip_early: false, early_skipped: 0, ch1_digest: [0; 32], client_version: 0,
-        cr_context: [], cert_scheme: 0, peer_verified: false, peer_schemes: [], alpn: [], sni: [], tickets: 0, key_updates: 0,
+        cr_context: [], cert_scheme: 0, peer_verified: false, peer_schemes: [], alpn: [], sni: [], tickets: 0, key_updates: 0, renegotiations: 0, session_created: 0,
         psk_offered: false, resumed: false, psk_dhe: false, peer_not_after: 0, has_session: false, session: no_session(),
         ech_offered: false, ech_seen: false, ech_confirm: false, ech_accepted: false, ech_backend: false,
         ech_ctx: bignum::hpke_empty_context(), ech_kdf: 0, ech_aead: 0, ech_config_id: 0, ech_max_name: 0,
-        ech_public_name: [], ech_enc: [], outer_random: [0; 32], ech_retry: [], th_inner: transcript(256),
+        ech_public_name: [], ech_enc: [], outer_random: [0; 32], ech_retry: [], ech_retry_ok: false, th_inner: transcript(256),
         offer12: false, offer13: false, session12_offered: false, master: [], ems: false, peer_random: [0; 32],
         secure_reneg: false, ticket12: false, peer_share: [], log: log12(),
+        quic: false, rlevel: 0, wlevel: 0, quic_local: [], quic_peer: [], has_quic_peer: false,
         ch_inner: [], ch: [], inbuf: [], hs: [], chain: [],
     };
     var seed_bytes: u8[32] = [0; 32];
     if seed == 0 {
-        bignum::random_bytes(seed_bytes);
+        entropy::random_bytes(seed_bytes);
     } else {
         for i in 8 { seed_bytes[i] = (seed >> (8 * i)) as! u8; }
     }
@@ -450,12 +494,34 @@ fn peer_verified(c: const Conn&) -> bool { c.peer_verified }
 // Whether ECH was accepted: the server took the inner ClientHello. A
 // client whose ECH was not accepted fails with ech_required once the
 // handshake with the public name is done; ech_retry_configs then has the
-// configs the server sent for a retry (empty for none).
+// configs the server sent for a retry (empty for none). They are given
+// only after that handshake succeeded, the server's certificate and
+// Finished checked (§6.1.6): a handshake that failed in any other way
+// gives none, since whoever sent them was not authenticated.
 fn ech_accepted(c: const Conn&) -> bool { c.ech_accepted }
 
 fn ech_retry_configs(c: const Conn&) -> u8[>..] {
     var out: u8[>..] = [];
-    out.append(c.ech_retry);
+    if c.ech_retry_ok { out.append(c.ech_retry); }
+    return out;
+}
+
+// Keying material exported from the connection (RFC 5705, RFC 8446
+// §7.5): `len` bytes for `label` and `context` (TLS 1.2 without a
+// context when has_context is false; TLS 1.3 takes an absent context as
+// empty), the same on both ends. EAP-TLS, PEAP and TTLS take their keys
+// so. Empty before the handshake is done or after the secrets are wiped.
+fn export_keys(c: const Conn&, label: const u8[:], context: const u8[:], has_context: bool, len: i64) -> u8[>..] {
+    var out: u8[>..] = [];
+    if c.state != ST_CONNECTED || c.wiped || len <= 0 { return out; }
+    if c.version == VERSION_TLS13 {
+        out.append(export_keying_material(c.suite.hash, c.sch.exporter, label, context, len));
+    } else if c.version == VERSION_TLS12 {
+        var cr = c.random;
+        var sr = c.peer_random;
+        if c.is_server { cr = c.peer_random; sr = c.random; }
+        out.append(export12(c.suite.hash, c.master, label, context, has_context, cr, sr, len));
+    }
     return out;
 }
 
@@ -522,7 +588,9 @@ fn done(r: const Rd&) -> bool { !r.bad && r.pos == r.end }
 fn send_hs(c: Conn&, msg: const u8[:], out: u8[>..]&) {
     transcript_add(c.th, msg);
     if c.version == VERSION_TLS12 { log12_add(c.log, msg); }
-    if c.write_protected {
+    if c.quic {
+        quic_chunk(out, c.wlevel, msg);
+    } else if c.write_protected {
         out.append(seal_records(c.write, CT_HANDSHAKE, msg));
     } else {
         // 0x0301 only on the first ClientHello (§5.1), which does not come
@@ -539,7 +607,7 @@ fn hs_add(c: Conn&, msg: const u8[:]) {
 }
 
 fn send_ccs(c: Conn&, out: u8[>..]&) {
-    if c.ccs_sent { return; }
+    if c.ccs_sent || c.quic { return; }
     let one: u8[1] = [1];
     out.append(plain_record(CT_CHANGE_CIPHER_SPEC, one));
     c.ccs_sent = true;
@@ -573,7 +641,9 @@ fn wipe(c: Conn&) {
 fn fail(c: Conn&, desc: u8, out: u8[>..]&) -> i64 {
     if c.state == ST_FAILED { return -1; }
     let a = alert(ALERT_FATAL, desc);
-    if c.write_protected { out.append(seal_record(c.write, CT_ALERT, a)); }
+    // QUIC carries the alert as its CONNECTION_CLOSE's code instead.
+    if c.quic {}
+    else if c.write_protected { out.append(seal_record(c.write, CT_ALERT, a)); }
     else { out.append(plain_record(CT_ALERT, a)); }
     c.alert = desc;
     c.state = ST_FAILED;
@@ -583,7 +653,7 @@ fn fail(c: Conn&, desc: u8, out: u8[>..]&) -> i64 {
 
 // Application data, as records.
 fn send(c: Conn&, data: const u8[:], out: u8[>..]&) -> bool {
-    if c.state != ST_CONNECTED { return false; }
+    if c.state != ST_CONNECTED || c.quic { return false; }
     out.append(seal_records(c.write, CT_APPLICATION_DATA, data));
     return true;
 }
@@ -591,7 +661,7 @@ fn send(c: Conn&, data: const u8[:], out: u8[>..]&) -> bool {
 // close_notify; the connection sends nothing after it, and once closed
 // forgets its secrets.
 fn close(c: Conn&, out: u8[>..]&) {
-    if !c.write_protected || c.state == ST_FAILED || c.wiped { return; }
+    if !c.write_protected || c.state == ST_FAILED || c.wiped || c.quic { return; }
     let a = alert(ALERT_WARNING, ALERT_CLOSE_NOTIFY);
     out.append(seal_record(c.write, CT_ALERT, a));
     if c.state == ST_CONNECTED { c.state = ST_CLOSED; }
@@ -611,7 +681,7 @@ fn update_write(c: Conn&) {
 // Sends a KeyUpdate and moves to the next write keys; with `request`, the
 // peer is asked to update its own.
 fn key_update(c: Conn&, request: bool, out: u8[>..]&) -> bool {
-    if c.state != ST_CONNECTED || c.version != VERSION_TLS13 { return false; }
+    if c.state != ST_CONNECTED || c.version != VERSION_TLS13 || c.quic { return false; }
     let body: u8[1] = [if request { 1 } else { 0 }];
     out.append(seal_record(c.write, CT_HANDSHAKE, handshake_message(HS_KEY_UPDATE, body)));
     update_write(c);
@@ -867,9 +937,15 @@ fn pick_scheme(key: const x509::PrivateKey&, peer: const u16[:]) -> u16 {
     return 0;
 }
 
-// A signature with a scheme, and false when signing fails (x509::sign):
-// the handshake then ends with internal_error, as Go's does.
+// A signature with a scheme by the signer F (x509::sign_with), and false
+// when signing fails: the handshake then ends with internal_error, as Go's
+// does.
 fn sign(key: const x509::PrivateKey&, scheme: u16, msg: const u8[:]) -> u8[>..], bool {
+    let sig, ok = sign(key, scheme, msg, x509::sign_data);
+    return sig, ok;
+}
+
+fn sign<F>(key: const x509::PrivateKey&, scheme: u16, msg: const u8[:]) -> u8[>..], bool {
     var alg = x509::SIG_RSA_PSS;
     var h: i64 = 512;
     if scheme == x509::ED25519 { alg = x509::SIG_ED25519; h = 0; }
@@ -895,7 +971,7 @@ fn sign(key: const x509::PrivateKey&, scheme: u16, msg: const u8[:]) -> u8[>..],
     else if scheme == x509::RSA_PKCS1_SHA512 { alg = x509::SIG_RSA_PKCS1; h = 512; }
     else if scheme == x509::RSA_PSS_RSAE_SHA256 { h = 256; }
     else if scheme == x509::RSA_PSS_RSAE_SHA384 { h = 384; }
-    let sig, ok = x509::sign(key, alg, h, msg);
+    let sig, ok = x509::sign_with(key, alg, h, msg, F);
     return sig, ok;
 }
 
@@ -1054,6 +1130,11 @@ fn hello_message(c: const Conn&, cfg: const ClientConfig&, sni: const u8[:], ran
             b.append(cookie);
             patch_len(b, ck, 2);
         }
+        if c.quic {
+            let qp = begin_ext(b, EXT_QUIC_TRANSPORT_PARAMETERS);
+            b.append(c.quic_local);
+            patch_len(b, qp, 2);
+        }
         // psk_key_exchange_modes always, without which servers send no
         // tickets (§4.2.9).
         if c.offer13 {
@@ -1178,12 +1259,13 @@ fn client_start(c: Conn&, cfg: const ClientConfig&, out: u8[>..]&) {
     // with ECH, which is TLS 1.3's alone.
     c.offer13 = cfg.max_version >= VERSION_TLS13 && cfg.min_version <= VERSION_TLS13 && cfg.suites.len > 0;
     c.offer12 = cfg.min_version <= VERSION_TLS12 && cfg.max_version >= VERSION_TLS12 && cfg.suites12.len > 0 &&
-                cfg.ech_config_list.len == 0;
+                cfg.ech_config_list.len == 0 && !c.quic;
     // Checking the certificate needs a name to check it for: with none,
     // the client refuses to start, as Go does ("either ServerName or
     // InsecureSkipVerify must be specified").
+    // QUIC needs TLS 1.3 and an application protocol (RFC 9001 §8.1).
     if !c.offer13 && !c.offer12 || (cfg.ech_config_list.len > 0 && !c.offer13) ||
-       (cfg.verify && cfg.server_name.len == 0) {
+       (cfg.verify && cfg.server_name.len == 0) || (c.quic && (!c.offer13 || cfg.alpn.len == 0)) {
         c.alert = ALERT_INTERNAL_ERROR;
         c.state = ST_FAILED;
         return;
@@ -1191,7 +1273,9 @@ fn client_start(c: Conn&, cfg: const ClientConfig&, out: u8[>..]&) {
     drbg_fill(c, c.random);
     var sid: u8[32] = [0; 32];
     drbg_fill(c, sid);
-    c.session_id.append(sid);                      // middlebox compatibility mode; TLS 1.2 resumption
+    // Middlebox compatibility mode and TLS 1.2 resumption; not over QUIC
+    // (RFC 9001 §8.4).
+    if !c.quic { c.session_id.append(sid); }
     // A session is offered when it is still good for this server and one of
     // the suites offered has its hash (TLS 1.3), or is its suite (TLS 1.2).
     c.psk_offered = false;
@@ -1244,7 +1328,8 @@ fn client_start(c: Conn&, cfg: const ClientConfig&, out: u8[>..]&) {
     let ch, inner = build_client_hello(c, cfg, share_group, "");
     c.ch.append(ch);
     c.ch_inner.append(inner);
-    out.append(plain_records(CT_HANDSHAKE, ch, 0x0301));
+    if c.quic { quic_chunk(out, QUIC_INITIAL, ch); }
+    else { out.append(plain_records(CT_HANDSHAKE, ch, 0x0301)); }
     c.state = ST_WAIT_SH;
 }
 
@@ -1402,6 +1487,7 @@ fn client_server_hello(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: 
     schedule_handshake(c.sch, shared, transcript_hash(c.th));
     c.read = record_keys(s, c.sch.s_hs);
     c.read_protected = true;
+    c.rlevel = QUIC_HANDSHAKE;
     c.state = ST_WAIT_EE;
     return 0;
 }
@@ -1438,6 +1524,10 @@ fn client_encrypted_extensions(c: Conn&, cfg: const ClientConfig&, m: const u8[:
         if exts.bad { return fail(c, ALERT_DECODE_ERROR, out); }
         if ty == EXT_ALPN {
             if accept_alpn(c, cfg, m, e, out) != 0 { return -1; }
+        } else if ty == EXT_QUIC_TRANSPORT_PARAMETERS && c.quic {
+            if c.has_quic_peer || e.end - e.pos > c.quic_peer.cap { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
+            c.quic_peer.append(m[e.pos..e.end]);
+            c.has_quic_peer = true;
         } else if ty == EXT_ENCRYPTED_CLIENT_HELLO && c.ech_offered {
             // Retry configs, only when ECH was not accepted (§7.1).
             if c.ech_accepted { return fail(c, ALERT_UNSUPPORTED_EXTENSION, out); }
@@ -1445,10 +1535,22 @@ fn client_encrypted_extensions(c: Conn&, cfg: const ClientConfig&, m: const u8[:
                 c.ech_retry.clear();
                 c.ech_retry.append(m[e.pos..e.end]);
             }
-        } else if ty == EXT_KEY_SHARE || ty == EXT_SUPPORTED_VERSIONS || ty == EXT_COOKIE || ty == EXT_SIGNATURE_ALGORITHMS {
-            return fail(c, ALERT_ILLEGAL_PARAMETER, out);     // forbidden in EncryptedExtensions
+        } else if ty == EXT_KEY_SHARE || ty == EXT_SUPPORTED_VERSIONS || ty == EXT_COOKIE || ty == EXT_SIGNATURE_ALGORITHMS ||
+                  ty == EXT_PRE_SHARED_KEY || ty == EXT_PSK_KEY_EXCHANGE_MODES || ty == EXT_CERTIFICATE_AUTHORITIES ||
+                  ty == EXT_PADDING || ty == EXT_EC_POINT_FORMATS || ty == EXT_EXTENDED_MASTER_SECRET ||
+                  ty == EXT_SESSION_TICKET || ty == EXT_RENEGOTIATION_INFO {
+            // Known, and of other messages: forbidden here (RFC 8446 §4.2).
+            return fail(c, ALERT_ILLEGAL_PARAMETER, out);
+        } else if ty == EXT_EARLY_DATA {
+            // Never offered: 0-RTT is not sent.
+            return fail(c, ALERT_UNSUPPORTED_EXTENSION, out);
         }
+        // Others, unknown here, are ignored, as Go and BoringSSL do.
     }
+    // Over QUIC the server must send its transport parameters and agree
+    // on a protocol (RFC 9001 §8).
+    if c.quic && !c.has_quic_peer { return fail(c, ALERT_MISSING_EXTENSION, out); }
+    if c.quic && c.alpn.len == 0 { return fail(c, ALERT_NO_APPLICATION_PROTOCOL, out); }
     transcript_add(c.th, m);
     // Resumed, the server authenticates with the PSK alone.
     c.state = if c.resumed { ST_WAIT_FINISHED } else { ST_WAIT_CERT_CR };
@@ -1683,9 +1785,9 @@ fn certificate_message(context: const u8[:], chain: const u8[:]) -> u8[>..], boo
 
 // A CertificateVerify by `key` over the transcript hash `th`, and false
 // when signing fails.
-fn certificate_verify_message(key: const x509::PrivateKey&, scheme: u16, server_side: bool,
+fn certificate_verify_message<F>(key: const x509::PrivateKey&, scheme: u16, server_side: bool,
                               th: const u8[:]) -> u8[>..], bool {
-    let sig, ok = sign(key, scheme, cv_content(server_side, th));
+    let sig, ok = sign(key, scheme, cv_content(server_side, th), F);
     if !ok {
         var none: u8[>..] = [];
         return none, false;
@@ -1697,7 +1799,7 @@ fn certificate_verify_message(key: const x509::PrivateKey&, scheme: u16, server_
     return handshake_message(HS_CERTIFICATE_VERIFY, cv), true;
 }
 
-fn client_finished(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8[>..]&) -> i64 {
+fn client_finished<F>(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8[>..]&) -> i64 {
     if m.len - 4 != c.suite.hash / 8 { return fail(c, ALERT_DECODE_ERROR, out); }
     if !finished_ok(c.suite.hash, c.sch.s_hs, transcript_hash(c.th), m[4..]) {
         return fail(c, ALERT_DECRYPT_ERROR, out);
@@ -1711,6 +1813,7 @@ fn client_finished(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8[>
     send_ccs(c, out);
     c.write = record_keys(c.suite, c.sch.c_hs);
     c.write_protected = true;
+    c.wlevel = QUIC_HANDSHAKE;
     if c.cert_requested && c.cert_scheme == 0 {
         let cm, okm = certificate_message(c.cr_context, "");
         send_hs(c, cm, out);
@@ -1718,7 +1821,7 @@ fn client_finished(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8[>
         let cm, okm = certificate_message(c.cr_context, cfg.cert_chain);
         if !okm { return fail(c, ALERT_INTERNAL_ERROR, out); }
         send_hs(c, cm, out);
-        let cv, okv = certificate_verify_message(cfg.cert_key, c.cert_scheme, false, transcript_hash(c.th));
+        let cv, okv = certificate_verify_message(cfg.cert_key, c.cert_scheme, false, transcript_hash(c.th), F);
         if !okv { return fail(c, ALERT_INTERNAL_ERROR, out); }
         send_hs(c, cv, out);
     }
@@ -1727,16 +1830,21 @@ fn client_finished(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8[>
     schedule_resumption(c.sch, transcript_hash(c.th));
     c.write = record_keys(c.suite, c.sch.c_ap);
     c.read = record_keys(c.suite, c.sch.s_ap);
+    c.wlevel = QUIC_APPLICATION;
+    c.rlevel = QUIC_APPLICATION;
     c.state = ST_CONNECTED;
     // ECH not accepted: the handshake with the public name only served to
     // authenticate the retry configs (§6.1.6).
-    if c.ech_offered && !c.ech_accepted { return fail(c, ALERT_ECH_REQUIRED, out); }
+    if c.ech_offered && !c.ech_accepted {
+        c.ech_retry_ok = c.peer_verified;
+        return fail(c, ALERT_ECH_REQUIRED, out);
+    }
     return 0;
 }
 
-fn client_message(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8[>..]&) -> i64 {
+fn client_message<F>(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8[>..]&) -> i64 {
     let t = m[0];
-    if c.version == VERSION_TLS12 { return client_message12(c, cfg, m, out); }
+    if c.version == VERSION_TLS12 { return client_message12(c, cfg, m, out, F); }
     if c.state == ST_WAIT_SH && t == HS_SERVER_HELLO { return client_server_hello(c, cfg, m, out); }
     if c.state == ST_WAIT_EE && t == HS_ENCRYPTED_EXTENSIONS { return client_encrypted_extensions(c, cfg, m, out); }
     if c.state == ST_WAIT_CERT_CR && t == HS_CERTIFICATE_REQUEST { return client_certificate_request(c, cfg, m, out); }
@@ -1748,7 +1856,7 @@ fn client_message(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8[>.
         if r == 0 { c.state = ST_WAIT_FINISHED; }
         return r;
     }
-    if c.state == ST_WAIT_FINISHED && t == HS_FINISHED { return client_finished(c, cfg, m, out); }
+    if c.state == ST_WAIT_FINISHED && t == HS_FINISHED { return client_finished(c, cfg, m, out, F); }
     if c.state == ST_CONNECTED && t == HS_NEW_SESSION_TICKET { return client_ticket(c, cfg, m, out); }
     if c.state == ST_CONNECTED { return post_handshake(c, m, out); }
     return fail(c, ALERT_UNEXPECTED_MESSAGE, out);
@@ -1807,6 +1915,7 @@ struct Hello {
     version: i64, has_versions: bool, has_versions12: bool, points: Rd, has_points: bool, ems: bool,
     has_reneg: bool, reneg_empty: bool, ticket: Rd, has_ticket: bool,
     comp_null_only: bool, early_data: bool,
+    quic_params: Rd, has_quic_params: bool,
     alert: u8,                        // when parsing fails: the alert, if not decode_error
 }
 
@@ -1820,7 +1929,7 @@ fn parse_hello(m: const u8[:]) -> Hello, bool {
         psk_ids: empty_rd(), psk_binders: empty_rd(), binders_at: 0, has_psk: false, psk_dhe: false,
         version: 0, has_versions: false, has_versions12: false, points: empty_rd(), has_points: false, ems: false,
         has_reneg: false, reneg_empty: false, ticket: empty_rd(), has_ticket: false,
-        comp_null_only: false, early_data: false, alert: 0,
+        comp_null_only: false, early_data: false, quic_params: empty_rd(), has_quic_params: false, alert: 0,
     };
     var b = Rd { pos: 4, end: m.len, bad: false };
     let ver = get_u16(b, m);
@@ -1943,6 +2052,11 @@ fn parse_hello(m: const u8[:]) -> Hello, bool {
             if l.bad { return h, false; }
         } else if ty == EXT_COOKIE {
             h.cookie = get_vec(e, m, 2);
+        } else if ty == EXT_QUIC_TRANSPORT_PARAMETERS {
+            if h.has_quic_params { return h, false; }
+            h.quic_params = e;
+            h.has_quic_params = true;
+            e.pos = e.end;
         } else if ty == EXT_PSK_KEY_EXCHANGE_MODES {
             var l = get_vec(e, m, 1);
             while l.pos < l.end { if get_u8(l, m) == PSK_DHE_KE { h.psk_dhe = true; } }
@@ -2189,7 +2303,7 @@ fn ech_retry_list(cfg: const ServerConfig&) -> u8[>..] {
     return ech_config_list(configs);
 }
 
-fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: u8[>..]&) -> i64 {
+fn server_client_hello<F>(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: u8[>..]&) -> i64 {
     let h, ok = parse_hello(m);
     if !ok { return fail(c, if h.alert != 0 { h.alert } else { ALERT_DECODE_ERROR }, out); }
     // A legacy_version below TLS 1.0 is no version this server has.
@@ -2205,7 +2319,7 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
     let v12 = (if h.has_versions { h.has_versions12 } else { h.version >= 0x0303 }) &&
               cfg.min_version <= VERSION_TLS12 && cfg.max_version >= VERSION_TLS12 && cfg.suites12.len > 0;
     if !v13 {
-        if v12 && !second && !c.ech_confirm { return server_client_hello12(c, cfg, m, h, out); }
+        if v12 && !second && !c.ech_confirm && !c.quic { return server_client_hello12(c, cfg, m, h, out, F); }
         // TLS_FALLBACK_SCSV from a client that could do better is told so,
         // even when its version is one this server lacks (RFC 7507 §3).
         if in_u16_list(m, h.suites, TLS_FALLBACK_SCSV) && client_max_version(h) < cfg.max_version {
@@ -2219,6 +2333,16 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
     c.skip_early = h.early_data && !second;
     if !h.has_groups || !h.has_shares || !h.has_schemes { return fail(c, ALERT_MISSING_EXTENSION, out); }
     if second && m[h.sid.pos..h.sid.end] != c.session_id[..] { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
+    // Over QUIC: the client's transport parameters, no compatibility mode
+    // (RFC 9001 §8.2, §8.4).
+    if c.quic && !h.has_quic_params { return fail(c, ALERT_MISSING_EXTENSION, out); }
+    if c.quic && h.sid.end > h.sid.pos { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
+    if c.quic && !second {
+        if h.quic_params.end - h.quic_params.pos > c.quic_peer.cap { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
+        c.quic_peer.clear();
+        c.quic_peer.append(m[h.quic_params.pos..h.quic_params.end]);
+        c.has_quic_peer = true;
+    }
     // The suite: the server's first that the client offers.
     var chosen: u16 = 0;
     for s in cfg.suites {
@@ -2261,6 +2385,7 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
     take_peer_schemes(c, m, h.schemes, SIG_SCHEMES);
     let scheme = pick_scheme(cfg.key, c.peer_schemes);
     if select_alpn(c, cfg, h, m, out) != 0 { return -1; }
+    if c.quic && c.alpn.len == 0 { return fail(c, ALERT_NO_APPLICATION_PROTOCOL, out); }
     c.sni.clear();
     c.sni.append(m[h.sni.pos..h.sni.end]);       // at most 255 bytes (parse_hello)
     if !second {
@@ -2288,6 +2413,7 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
                t.sni[..] == c.sni[..] && ticket_client_ok(cfg, t, now) {
                 psk_identity = idx;
                 psk.append(t.psk);
+                c.session_created = t.created;
                 // The client's certificate, carried over.
                 c.chain.clear();
                 c.chain.append(t.client_chain);
@@ -2296,6 +2422,23 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
             }
             idx++;
         }
+        // As many binders as identities (§4.2.11), each 32 to 255 bytes.
+        var ni = h.psk_ids;
+        var identities = 0;
+        while ni.pos < ni.end && !ni.bad {
+            let one = get_vec(ni, m, 2);
+            let age = get_bytes(ni, 4);
+            identities++;
+        }
+        var nb = h.psk_binders;
+        var binders = 0;
+        while nb.pos < nb.end && !nb.bad {
+            let one = get_vec(nb, m, 1);
+            if one.end - one.pos < 32 { nb.bad = true; }
+            binders++;
+        }
+        if ni.bad { return fail(c, ALERT_DECODE_ERROR, out); }
+        if nb.bad || binders != identities { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
         if psk_identity >= 0 {
             var bl = h.psk_binders;
             var binder = empty_rd();
@@ -2325,6 +2468,8 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
     c.write_protected = true;
     c.read = record_keys(s, c.sch.c_hs);
     c.read_protected = true;
+    c.wlevel = QUIC_HANDSHAKE;
+    c.rlevel = QUIC_HANDSHAKE;
     // EncryptedExtensions, Certificate, CertificateVerify, Finished.
     var ee: u8[>..] = [];
     let exts = begin_vec(ee, 2);
@@ -2335,6 +2480,11 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
         ee.append(c.alpn);
         patch_len(ee, l, 2);
         patch_len(ee, a, 2);
+    }
+    if c.quic {
+        let qp = begin_ext(ee, EXT_QUIC_TRANSPORT_PARAMETERS);
+        ee.append(c.quic_local);
+        patch_len(ee, qp, 2);
     }
     // ECH offered and not accepted: the retry configs, if any (§7.1).
     if c.ech_seen && !c.ech_confirm {
@@ -2351,13 +2501,14 @@ fn server_client_hello(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: 
     // if any, comes from the ticket.
     if !c.resumed {
         if cfg.client_auth != NO_CLIENT_CERT { send_certificate_request(c, cfg, out); }
-        let e = send_certificate(c, cfg, scheme, out);
+        let e = send_certificate(c, cfg, scheme, out, F);
         if e != 0 { return e; }
     }
     let fin = finished_data(s.hash, c.sch.s_hs, transcript_hash(c.th));
     send_hs(c, handshake_message(HS_FINISHED, fin), out);
     schedule_master(c.sch, transcript_hash(c.th));
     c.write = record_keys(s, c.sch.s_ap);
+    c.wlevel = QUIC_APPLICATION;
     c.state = if c.cert_requested { ST_WAIT_CLIENT_CERT } else { ST_WAIT_CLIENT_FINISHED };
     return 0;
 }
@@ -2420,11 +2571,11 @@ fn send_certificate_request(c: Conn&, cfg: const ServerConfig&, out: u8[>..]&) {
 }
 
 // Certificate and CertificateVerify.
-fn send_certificate(c: Conn&, cfg: const ServerConfig&, scheme: u16, out: u8[>..]&) -> i64 {
+fn send_certificate<F>(c: Conn&, cfg: const ServerConfig&, scheme: u16, out: u8[>..]&) -> i64 {
     let cm, ok = certificate_message("", cfg.chain);
     if !ok { return fail(c, ALERT_INTERNAL_ERROR, out); }
     send_hs(c, cm, out);
-    let cv, okv = certificate_verify_message(cfg.key, scheme, true, transcript_hash(c.th));
+    let cv, okv = certificate_verify_message(cfg.key, scheme, true, transcript_hash(c.th), F);
     if !okv { return fail(c, ALERT_INTERNAL_ERROR, out); }
     send_hs(c, cv, out);
     return 0;
@@ -2495,7 +2646,11 @@ fn send_session_ticket(c: Conn&, cfg: const ServerConfig&, out: u8[>..]&) -> boo
     drbg_fill(c, age_add);
     var tn: u8[12] = [0; 12];
     drbg_fill(c, tn);
-    var t = TicketState { version: VERSION_TLS13, suite: c.suite.id, psk: [], ems: false, created: now_ms(cfg.now) / 1000,
+    // A ticket from a resumed connection keeps the first handshake's time:
+    // resuming again and again does not stretch a session past the
+    // lifetime (nor a client certificate checked then).
+    let created = if c.session_created > 0 { c.session_created } else { now_ms(cfg.now) / 1000 };
+    var t = TicketState { version: VERSION_TLS13, suite: c.suite.id, psk: [], ems: false, created: created,
                           age_add: (age_add[0] as u32) << 24 | (age_add[1] as u32) << 16 | (age_add[2] as u32) << 8 | age_add[3],
                           lifetime: MAX_TICKET_LIFETIME, alpn: [], sni: [], client_not_after: 0,
                           client_verified: false, client_chain: [] };
@@ -2518,17 +2673,19 @@ fn send_session_ticket(c: Conn&, cfg: const ServerConfig&, out: u8[>..]&) -> boo
     b.append(ticket);
     put_u16(b, 0);
     // After the handshake, outside the transcript.
-    out.append(seal_records(c.write, CT_HANDSHAKE, handshake_message(HS_NEW_SESSION_TICKET, b)));
+    let nst = handshake_message(HS_NEW_SESSION_TICKET, b);
+    if c.quic { quic_chunk(out, c.wlevel, nst); }
+    else { out.append(seal_records(c.write, CT_HANDSHAKE, nst)); }
     return true;
 }
 
-fn server_message(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: u8[>..]&) -> i64 {
+fn server_message<F>(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: u8[>..]&) -> i64 {
     let t = m[0];
     if c.version == VERSION_TLS12 { return server_message12(c, cfg, m, out); }
     if (c.state == ST_WAIT_CH || c.state == ST_WAIT_CH2) && t == HS_CLIENT_HELLO {
         let ch, re = server_ech(c, cfg, m, out);
         if re != 0 { return re; }
-        let r = server_client_hello(c, cfg, ch, out);
+        let r = server_client_hello(c, cfg, ch, out, F);
         if r == 0 && c.hs.len != 0 { return fail(c, ALERT_UNEXPECTED_MESSAGE, out); }
         return r;
     }
@@ -2547,6 +2704,7 @@ fn server_message(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: u8[>.
         transcript_add(c.th, m);
         schedule_resumption(c.sch, transcript_hash(c.th));
         c.read = record_keys(c.suite, c.sch.c_ap);
+        c.rlevel = QUIC_APPLICATION;
         c.state = ST_CONNECTED;
         // Tickets only for a client that can use them (§4.2.9).
         if c.psk_dhe { for i in cfg.tickets { let ok = send_session_ticket(c, cfg, out); } }
@@ -2566,6 +2724,8 @@ fn post_handshake(c: Conn&, m: const u8[:], out: u8[>..]&) -> i64 {
         return 0;
     }
     if m[0] == HS_KEY_UPDATE {
+        // QUIC updates its own keys (RFC 9001 §6).
+        if c.quic { return fail(c, ALERT_UNEXPECTED_MESSAGE, out); }
         if m.len != 5 { return fail(c, ALERT_DECODE_ERROR, out); }
         if m[4] > 1 { return fail(c, ALERT_ILLEGAL_PARAMETER, out); }
         if c.hs.len != 0 { return fail(c, ALERT_UNEXPECTED_MESSAGE, out); }
@@ -2584,12 +2744,12 @@ fn post_handshake(c: Conn&, m: const u8[:], out: u8[>..]&) -> i64 {
 }
 
 // A handshake message to the side whose configuration cfg is.
-fn role_message(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8[>..]&) -> i64 { client_message(c, cfg, m, out) }
-fn role_message(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: u8[>..]&) -> i64 { server_message(c, cfg, m, out) }
+fn role_message<F>(c: Conn&, cfg: const ClientConfig&, m: const u8[:], out: u8[>..]&) -> i64 { client_message(c, cfg, m, out, F) }
+fn role_message<F>(c: Conn&, cfg: const ServerConfig&, m: const u8[:], out: u8[>..]&) -> i64 { server_message(c, cfg, m, out, F) }
 
 // One whole record. cfg is the side's own configuration, a ClientConfig or
 // a ServerConfig: this and feed are compiled once for each.
-fn handle_record(c: Conn&, cfg, rec: const u8[:], out: u8[>..]&, app: u8[>..]&) -> i64 {
+fn handle_record<F>(c: Conn&, cfg, rec: const u8[:], out: u8[>..]&, app: u8[>..]&) -> i64 {
     let outer = rec[0];
     var ctype = outer;
     var payload: u8[>..] = [];
@@ -2672,6 +2832,12 @@ fn handle_record(c: Conn&, cfg, rec: const u8[:], out: u8[>..]&, app: u8[>..]&) 
         return 0;
     }
     if ctype != CT_HANDSHAKE || payload.len == 0 { return fail(c, ALERT_UNEXPECTED_MESSAGE, out); }
+    return handshake_data(c, cfg, payload, out, F);
+}
+
+// Handshake bytes, from records or (QUIC) CRYPTO frames: reassembled into
+// messages, each handled in turn.
+fn handshake_data<F>(c: Conn&, cfg, payload: const u8[:], out: u8[>..]&) -> i64 {
     // A handshake message longer than MAX_HANDSHAKE: its length is wrong
     // for this implementation, so decode_error (RFC 8446 §6.2: "the length
     // of the message was incorrect"), as tlsfuzzer expects; Go sends
@@ -2687,7 +2853,7 @@ fn handle_record(c: Conn&, cfg, rec: const u8[:], out: u8[>..]&, app: u8[>..]&) 
         var rest: u8[..65540] = [];
         rest.append(c.hs[n..]);
         c.hs = rest;
-        let r = role_message(c, cfg, msg, out);
+        let r = role_message(c, cfg, msg, out, F);
         if r != 0 { return r; }
         // A change of read keys (after ServerHello) must fall at a record boundary.
         if c.hs.len > 0 && c.state == ST_WAIT_EE { return fail(c, ALERT_UNEXPECTED_MESSAGE, out); }
@@ -2701,8 +2867,18 @@ fn handle_record(c: Conn&, cfg, rec: const u8[:], out: u8[>..]&, app: u8[>..]&) 
 
 // Feeds received bytes; appends what to send to `out` and application
 // data to `app`. Returns 0, or -1 once the connection has failed (the
-// alert, already in `out` when it was ours, is in c.alert).
+// alert, already in `out` when it was ours, is in c.alert). Its own
+// certificate's signature (a server's, or a client's when one is asked
+// for) is made by the key in cfg; for a key held elsewhere (an
+// x509::external_key in cfg) pass a signer as the last argument, as
+// x509::sign_data describes:
+//
+//   tls::feed(c, cfg, input, out, app) { k, alg, h, data => tpm2::sign_data(t, key, alg, h, data) }
 fn feed(c: Conn&, cfg, input: const u8[:], out: u8[>..]&, app: u8[>..]&) -> i64 {
+    return feed(c, cfg, input, out, app, x509::sign_data);
+}
+
+fn feed<F>(c: Conn&, cfg, input: const u8[:], out: u8[>..]&, app: u8[>..]&) -> i64 {
     var off = 0;
     while off < input.len {
         if c.state == ST_FAILED { return -1; }
@@ -2725,7 +2901,7 @@ fn feed(c: Conn&, cfg, input: const u8[:], out: u8[>..]&, app: u8[>..]&) -> i64 
         var rec: u8[>..] = [];
         rec.append(c.inbuf);
         c.inbuf.clear();
-        let r = handle_record(c, cfg, rec, out, app);
+        let r = handle_record(c, cfg, rec, out, app, F);
         if r != 0 { return r; }
     }
     return if c.state == ST_FAILED { -1 } else { 0 };
@@ -2737,4 +2913,107 @@ fn client_feed(c: Conn&, cfg: const ClientConfig&, input: const u8[:], out: u8[>
 
 fn server_feed(c: Conn&, cfg: const ServerConfig&, input: const u8[:], out: u8[>..]&, app: u8[>..]&) -> i64 {
     return feed(c, cfg, input, out, app);
+}
+
+// The same, with a signer for a key held elsewhere (feed).
+fn client_feed<F>(c: Conn&, cfg: const ClientConfig&, input: const u8[:], out: u8[>..]&, app: u8[>..]&) -> i64 {
+    return feed(c, cfg, input, out, app, F);
+}
+
+fn server_feed<F>(c: Conn&, cfg: const ServerConfig&, input: const u8[:], out: u8[>..]&, app: u8[>..]&) -> i64 {
+    return feed(c, cfg, input, out, app, F);
+}
+
+// --- QUIC (RFC 9001 §4) ---------------------------------------------------------
+
+// The encryption levels: where handshake bytes travel, and which keys
+// protect the packets that carry them.
+let QUIC_INITIAL: u8 = 0;
+let QUIC_EARLY: u8 = 1;
+let QUIC_HANDSHAKE: u8 = 2;
+let QUIC_APPLICATION: u8 = 3;
+
+// A connection for QUIC: its handshake goes out as CRYPTO data rather
+// than records. params is this side's transport parameters (RFC 9000
+// §18), encoded; the peer's are quic_peer_params once its hello is read.
+fn quic_client(cfg: const ClientConfig&, params: const u8[:]) -> Conn {
+    var c = new_conn(false, cfg.seed);
+    c.quic = true;
+    c.quic_local.append(params[..::min(params.len, c.quic_local.cap)]);
+    return c;
+}
+
+fn quic_server(cfg: const ServerConfig&, params: const u8[:]) -> Conn {
+    var c = new_conn(true, cfg.seed);
+    c.quic = true;
+    c.quic_local.append(params[..::min(params.len, c.quic_local.cap)]);
+    return c;
+}
+
+// Handshake bytes to send in CRYPTO frames at a level, in `out` as
+// chunks: the level, a 3-byte length, the bytes.
+fn quic_chunk(out: u8[>..]&, level: u8, msg: const u8[:]) {
+    out.push(level);
+    out.push((msg.len >> 16) as! u8);
+    out.push((msg.len >> 8) as! u8);
+    out.push(msg.len as! u8);
+    out.append(msg);
+}
+
+// The chunk at out[at..]: its level, the bytes' offset and length, and
+// the next chunk's offset; false at the end.
+fn quic_next_chunk(out: const u8[:], at: i64) -> u8, i64, i64, i64, bool {
+    if at + 4 > out.len { return 0, 0, 0, at, false; }
+    let n = (out[at + 1] as i64) << 16 | (out[at + 2] as i64) << 8 | out[at + 3];
+    if at + 4 + n > out.len { return 0, 0, 0, at, false; }
+    return out[at], at + 4, n, at + 4 + n, true;
+}
+
+// CRYPTO data received at a level, in order (QUIC reassembles the
+// stream): handshake messages, handled as feed handles them in records.
+// What to send goes into `out` as chunks. 0, or -1 once the handshake has
+// failed (c.alert is the alert, which QUIC sends as CRYPTO_ERROR + it).
+// Data at a level other than the one TLS reads now is unexpected_message.
+fn feed_crypto(c: Conn&, cfg, level: u8, data: const u8[:], out: u8[>..]&) -> i64 {
+    return feed_crypto(c, cfg, level, data, out, x509::sign_data);
+}
+
+fn feed_crypto<F>(c: Conn&, cfg, level: u8, data: const u8[:], out: u8[>..]&) -> i64 {
+    if c.state == ST_FAILED { return -1; }
+    if !c.quic { return fail(c, ALERT_INTERNAL_ERROR, out); }
+    if data.len == 0 { return 0; }
+    if level != c.rlevel { return fail(c, ALERT_UNEXPECTED_MESSAGE, out); }
+    return handshake_data(c, cfg, data, out, F);
+}
+
+// The client's first flight (its ClientHello), as a chunk in `out`.
+fn quic_start(c: Conn&, cfg: const ClientConfig&, out: u8[>..]&) { client_start(c, cfg, out); }
+
+// The level TLS reads and writes at now.
+fn quic_read_level(c: const Conn&) -> u8 { c.rlevel }
+fn quic_write_level(c: const Conn&) -> u8 { c.wlevel }
+
+// The traffic secret for reading or writing at a level (HANDSHAKE or
+// APPLICATION), once TLS has it; with the suite (its hash and AEAD).
+fn quic_secret(c: const Conn&, level: u8, write: bool) -> u8[>..] {
+    var r: u8[>..] = [];
+    let client_side = c.is_server != write;            // the client's secret?
+    if level == QUIC_HANDSHAKE { r.append(if client_side { c.sch.c_hs[..] } else { c.sch.s_hs[..] }); }
+    if level == QUIC_APPLICATION { r.append(if client_side { c.sch.c_ap[..] } else { c.sch.s_ap[..] }); }
+    return r;
+}
+
+fn quic_suite(c: const Conn&) -> Suite { c.suite }
+
+fn quic_peer_params(c: const Conn&) -> u8[>..], bool {
+    var r: u8[>..] = [];
+    r.append(c.quic_peer);
+    return r, c.has_quic_peer;
+}
+
+// The protocol agreed (ALPN).
+fn alpn(c: const Conn&) -> u8[>..] {
+    var r: u8[>..] = [];
+    r.append(c.alpn);
+    return r;
 }
